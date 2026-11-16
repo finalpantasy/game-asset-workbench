@@ -9,9 +9,9 @@ use wb_core::geom::dist;
 use wb_core::render::{self, Camera, Filter};
 use wb_core::Model;
 
-pub const VIEWS_USAGE: &str = "  zidane-inspector views [list] [--json]
+pub const VIEWS_USAGE: &str = "  gaw views [list] [--json]
       Lists the saved inspection views (Mark & fix page, Views card): camera, pose and time.
-  zidane-inspector views render FILE.glb --out-dir DIR [--names a,b] [--size W,H]
+  gaw views render FILE.glb --out-dir DIR [--names a,b] [--size W,H]
       Renders FILE.glb from every saved view (or the named ones) to DIR/<view>.png, posed like
       the view. Render the stock file and a candidate the same way to compare them view by view.";
 
@@ -62,7 +62,7 @@ pub fn store_views(path: &Path, views: &[SavedView]) -> Result<(), String> {
     }
     let j = json!({
         "workbench_views": 1,
-        "about": "Saved inspection views from Mark & fix. Render them for any GLB with: zidane-inspector views render FILE.glb --out-dir DIR",
+        "about": "Saved inspection views from Mark & fix. Render them for any GLB with: gaw views render FILE.glb --out-dir DIR",
         "views": views.iter().map(view_to_json).collect::<Vec<_>>(),
     });
     std::fs::write(path, serde_json::to_string_pretty(&j).unwrap()).map_err(|e| e.to_string())

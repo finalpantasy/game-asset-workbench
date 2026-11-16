@@ -10,6 +10,11 @@ keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
 
+# The program is `gaw` (Game Asset Workbench). `zidane-inspector` (src/bin) is the old name, kept as an alias.
+[[bin]]
+name = "gaw"
+path = "src/main.rs"
+
 [dependencies]
 wb-core = { path = "../wb-core" }
 serde_json.workspace = true

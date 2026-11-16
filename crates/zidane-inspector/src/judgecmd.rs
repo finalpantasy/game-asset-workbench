@@ -1,4 +1,4 @@
-//! `zidane-inspector judge`: perceptual checks (FLIP, SSIM) on two images or two GLBs, golden
+//! `gaw judge`: perceptual checks (FLIP, SSIM) on two images or two GLBs, golden
 //! renders, and regression runs against them. The math is in `wb_core::perceptual`, the fixed view
 //! set in `wb_core::golden`. Nothing here touches an input file or the game folder.
 use crate::{Args, KIT_PARTS};
@@ -12,7 +12,7 @@ use wb_core::strands;
 use wb_core::perceptual::{self as pc, Rgb, Stats};
 use wb_core::{image_textures, Model};
 
-pub const JUDGE_USAGE: &str = "  zidane-inspector judge REF TEST [options]
+pub const JUDGE_USAGE: &str = "  gaw judge REF TEST [options]
       Perceptual check of TEST against REF: two PNG images, or two GLBs drawn from the same
       cameras (the standard view set: idle, run 0.75 s, walk 0.25 s; game size and close-ups).
       Prints mean / 95th percentile FLIP (LDR-FLIP, NVIDIA, BSD-3), SSIM, and a score per body
@@ -31,12 +31,12 @@ pub const JUDGE_USAGE: &str = "  zidane-inspector judge REF TEST [options]
       --heat-all               also write one heat map per large view and close-up (heat/)
       --warn X --fail X        verdict limits on the score (see REVIEW.md in experiments/goldens)
       --json                   print the result as JSON
-  zidane-inspector judge --make-goldens MODEL.glb --name NAME --out-dir DIR [--force]
+  gaw judge --make-goldens MODEL.glb --name NAME --out-dir DIR [--force]
       Draws the standard view set of MODEL into DIR/NAME with a manifest.json (cameras, sizes,
       source hash). Never overwrites without --force.
-  zidane-inspector judge --golden-dir DIR/NAME CANDIDATE.glb [--out-dir D2]
+  gaw judge --golden-dir DIR/NAME CANDIDATE.glb [--out-dir D2]
       Draws CANDIDATE from the stored cameras and scores it against the stored pictures.
-  zidane-inspector judge --strands MODEL.glb [--ref STOCK.glb] [--out-dir DIR] [--json]
+  gaw judge --strands MODEL.glb [--ref STOCK.glb] [--out-dir DIR] [--json]
       No-reference hair check: measures the direction the painted strands run (structure tensor on
       the hair texture), maps it onto the surface, and scores how well it continues across every UV
       seam (against the same measure on edges inside a chart) and how well it follows each lock's

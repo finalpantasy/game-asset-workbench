@@ -7,7 +7,7 @@ use wb_core::shells::{self, Shell};
 use wb_core::Model;
 
 /// Options that take a value in these commands (the global list does not know them).
-const OWN_VALUE_OPTS: [&str; 32] = ["--exit-raise", "--exit-curve", "--exit-max", "--exit-down", "--lift-len", 
+const OWN_VALUE_OPTS: [&str; 49] = ["--uv", "--pad", "--pad-uv", "--pad-slack","--dip", "--reach", "--image", "--bend-radius", "--attach-width", "--line-dip", "--clip-front", "--center-down", "--reference", "--half", "--seam-jump", "--protect-from", "--protect-tol", "--exit-raise", "--exit-curve", "--exit-max", "--exit-down", "--lift-len", 
     "--out", "--out-dir", "--size", "--touch", "--tol", "--reach", "--clip", "--time", "--shell", "--times", "--clips", "--on", "--json-out", "--labels",
     "--tip-thigh", "--thickness", "--ride", "--tuck-depth", "--columns", "--row-step", "--fit-frames", "--thigh-joint", "--fit-reach", "--max-thigh-share", "--clear-gap", "--tuck-len", "--exit-edge",
 ];
@@ -556,6 +556,9 @@ pub fn rebuild_cmd(args: &Args) -> Result<(), String> {
         lift_len: num(args, "--lift-len", d.lift_len)?,
         exit_max: num(args, "--exit-max", d.exit_max)?,
         exit_raise: num(args, "--exit-raise", d.exit_raise)?,
+        bend_radius: num(args, "--bend-radius", d.bend_radius)?,
+        attach_width: num(args, "--attach-width", d.attach_width)?,
+        wall_strip: !args.flag("--v2-walls"),
         exit_down: match args.opt("--exit-down") {
             Some(s) => s.split(',').map(|x| x.trim().parse::<f32>().map_err(|e| format!("--exit-down {x}: {e}"))).collect::<Result<Vec<_>, _>>()?,
             None => Vec::new(),
@@ -623,5 +626,336 @@ pub fn rebuild_cmd(args: &Args) -> Result<(), String> {
         built.length,
         built.tip_a
     );
+    Ok(())
+}
+
+/// `strap-check FILE.glb --out-dir DIR [--reference REF.glb] [--clips ..] [--times ..] [--size PX]
+/// [--half H] [--seam-jump J] [--protect-from D] [--protect-tol T] [--shell L] [--on L]`:
+/// close-ups of the strap root from the front, both sides, both 3/4 views and below, at rest and in
+/// the clips, three ways (plain, wireframe with flagged triangles, depth with flagged triangles),
+/// plus a seam report naming the triangles behind every open edge, crack, intersection and texture
+/// seam near the strap. With --reference, also checks that the protected part of the reference
+/// strap (from --protect-from below its top, by height) is kept, with its stand-off from the body.
+pub fn check_cmd(args: &Args) -> Result<(), String> {
+    use wb_core::edit::Topo;
+    use wb_core::strapcheck::{self as sc, Overlay, ATTACH_VIEWS};
+    let path = file_args(args).into_iter().next().ok_or("strap-check needs FILE.glb")?;
+    let out_dir = PathBuf::from(args.opt("--out-dir").ok_or("strap-check needs --out-dir DIR")?);
+    std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
+    let clips: Vec<String> = args.opt("--clips").unwrap_or("idle,walk,run,turn_l,turn_r").split(',').map(str::to_owned).collect();
+    let times: Vec<f32> = args
+        .opt("--times")
+        .unwrap_or("0,0.25,0.5,0.75")
+        .split(',')
+        .map(|x| x.parse::<f32>().map_err(|e| format!("--times: {e}")))
+        .collect::<Result<_, _>>()?;
+    let size: usize = num(args, "--size", 260)?;
+    let half: f32 = num(args, "--half", 0.15)?;
+    let clip: f32 = num(args, "--clip-front", 0.08)?;
+    let center_down: f32 = num(args, "--center-down", 0.1)?;
+    let seam_jump: f32 = num(args, "--seam-jump", 0.08)?;
+    let protect_from: f32 = num(args, "--protect-from", 0.2)?;
+    let protect_tol: f32 = num(args, "--protect-tol", 0.002)?;
+    let line_dip: f32 = num(args, "--line-dip", 0.12)?;
+
+    let model = Model::open(&path)?;
+    let textures = wb_core::image_textures(&model);
+    let sh = shells::find(&model);
+    let (strap, body) = pick_shells(&sh, args)?;
+    let ts = shells::tri_shell(&model, &sh);
+    let topo = Topo::build(&model);
+    let ms = sh[strap].mesh;
+    let m = &model.meshes[ms];
+    let ytop = sh[strap].verts.iter().map(|&v| m.pos[v][1]).fold(f32::MIN, f32::max);
+    let band: Vec<usize> = sh[strap].verts.iter().copied().filter(|&v| (m.pos[v][1] - (ytop - center_down)).abs() <= 0.01).collect();
+    let mut c = [0.0f32; 3];
+    for &v in &band {
+        c = wb_core::geom::add(c, m.pos[v]);
+    }
+    let c = wb_core::geom::scale(c, 1.0 / band.len().max(1) as f32);
+    let track = track_point(&model, &sh, body, c);
+    let near: Vec<usize> = sh[strap].verts.iter().copied().filter(|&v| m.pos[v][1] >= ytop - 0.3).collect();
+    println!("{}: strap {} ({} tris), waist {}", path.display(), sh[strap].label, sh[strap].tris.len(), sh[body].label);
+
+    // Reference strap for the protected-part check.
+    let reference = match args.opt("--reference") {
+        Some(r) => {
+            let rm = Model::open(Path::new(r))?;
+            let rsh = shells::find(&rm);
+            let (rs, rb) = pick_shells(&rsh, args)?;
+            let rmesh = &rm.meshes[rsh[rs].mesh];
+            let rtop = rsh[rs].verts.iter().map(|&v| rmesh.pos[v][1]).fold(f32::MIN, f32::max);
+            let protect: Vec<usize> = rsh[rs].verts.iter().copied().filter(|&v| rmesh.pos[v][1] <= rtop - protect_from).collect();
+            println!("reference {r}: {} protected points (more than {protect_from} below its top)", protect.len());
+            Some((rm, rsh, rs, rb, protect, rtop))
+        }
+        None => None,
+    };
+
+    let mut poses: Vec<(String, Option<usize>, f32)> = vec![("rest".into(), None, 0.0)];
+    for clip in &clips {
+        let ci = model.clips.iter().position(|c| c == clip).ok_or_else(|| format!("no clip {clip}; clips: {}", model.clips.join(", ")))?;
+        let dur = model.clip_duration(ci);
+        for &tn in &times {
+            poses.push((format!("{clip} t={tn:.3}"), Some(ci), tn * dur));
+        }
+    }
+    let (label_w, head_h) = (200u32, 46u32);
+    let (sw, shh) = (label_w + (ATTACH_VIEWS.len() * size) as u32, head_h + (poses.len() * size) as u32);
+    let names = ["plain", "wire", "depth"];
+    let fname = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+    let mut sheets: Vec<image::RgbaImage> = names.iter().map(|_| image::RgbaImage::from_pixel(sw, shh, image::Rgba([24, 26, 31, 255]))).collect();
+    for (si, s) in sheets.iter_mut().enumerate() {
+        text(s, 8, 6, &format!("{fname}  ({})", names[si]), 2, [235, 235, 235]);
+        for (k, v) in ATTACH_VIEWS.iter().enumerate() {
+            text(s, label_w as i64 + (k * size) as i64 + 6, 22, v.name, 2, [200, 200, 210]);
+        }
+    }
+    let label_of = |t: u32| -> String {
+        let (mi, ti) = topo.tri_loc[t as usize];
+        let s = ts[mi][ti];
+        format!("{}:{} ({})", mi, ti, if s < sh.len() { sh[s].label.as_str() } else { "?" })
+    };
+    let mut pose_json = Vec::new();
+    // Thin dark lines per triangle over every pose and view: (pixels, views, hit summed).
+    let mut lines: std::collections::BTreeMap<u32, (usize, usize, [f32; 2], [f32; 2], f32, f32, f32)> = std::collections::BTreeMap::new();
+    let mut prot_poses: Vec<(String, Vec<Vec<[f32; 3]>>, Vec<Vec<[f32; 3]>>)> = Vec::new();
+    for (ri, (name, ci, t)) in poses.iter().enumerate() {
+        let pose = model.posed(*ci, *t);
+        let center = eval_track(&model, &sh, body, &pose, track);
+        // Views turn with the waist under the knot, so a side view stays a side view in turns.
+        let turn = {
+            let bm = sh[body].mesh;
+            let tri = model.meshes[bm].tris[track.0];
+            let nr = wb_core::geom::tri_normal(model.meshes[bm].pos[tri[0] as usize], model.meshes[bm].pos[tri[1] as usize], model.meshes[bm].pos[tri[2] as usize]);
+            let np = wb_core::geom::tri_normal(pose[bm][tri[0] as usize], pose[bm][tri[1] as usize], pose[bm][tri[2] as usize]);
+            let mut d = (np[0].atan2(np[2]) - nr[0].atan2(nr[2])).to_degrees();
+            while d > 180.0 {
+                d -= 360.0;
+            }
+            while d < -180.0 {
+                d += 360.0;
+            }
+            d
+        };
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for &v in &near {
+            for k in 0..3 {
+                lo[k] = lo[k].min(pose[ms][v][k] - 0.05);
+                hi[k] = hi[k].max(pose[ms][v][k] + 0.05);
+            }
+        }
+        let rep = sc::seam_report(&model, &textures, &topo, &pose, lo, hi, 0.002);
+        let strong: Vec<&sc::UvSeam> = rep.uv_seams.iter().filter(|s| s.color_jump > seam_jump).collect();
+        println!(
+            "  {name}: {} tris near the strap; open edges {}, cracks {}, intersections {}, texture seams {} ({} with a color jump over {seam_jump})",
+            rep.region_tris.len(),
+            rep.open_edges.len(),
+            rep.cracks.len(),
+            rep.intersections.len(),
+            rep.uv_seams.len(),
+            strong.len()
+        );
+        for &(a, b) in rep.intersections.iter().take(12) {
+            println!("      intersect {}  x  {}", label_of(a), label_of(b));
+        }
+        let gp = sc::group_pose(&topo, &pose);
+        for &(e, f) in rep.cracks.iter().take(8) {
+            println!("      crack edge {:?}-{:?} along {:?}-{:?}", gp[e.0 as usize], gp[e.1 as usize], gp[f.0 as usize], gp[f.1 as usize]);
+        }
+        let y0 = head_h + (ri * size) as u32;
+        for s in sheets.iter_mut() {
+            text(s, 8, y0 as i64 + 8, name, 2, [235, 235, 235]);
+        }
+        text(&mut sheets[1], 8, y0 as i64 + 34, &format!("x {} crack {}", rep.intersections.len(), rep.cracks.len()), 2, [255, 140, 140]);
+        text(&mut sheets[1], 8, y0 as i64 + 56, &format!("seam {} open {}", strong.len(), rep.open_edges.len()), 2, [255, 230, 120]);
+        let ovs = [
+            Overlay { wire: false, depth: false, flagged: false, seam_jump, clip },
+            Overlay { wire: true, depth: false, flagged: true, seam_jump, clip },
+            Overlay { wire: false, depth: true, flagged: true, seam_jump, clip },
+        ];
+        for (k, v0) in ATTACH_VIEWS.iter().enumerate() {
+            let v = &sc::AttachView { yaw_deg: v0.yaw_deg + turn, ..*v0 };
+            let cam = sc::attach_cam(center, v, half);
+            for (si, ov) in ovs.iter().enumerate() {
+                let px = sc::overlay_picture(&model, &textures, &topo, &pose, cam, size, Some(&rep), *ov);
+                let x0 = label_w + (k * size) as u32;
+                put(&mut sheets[si], x0, y0, &px, size);
+                frame_box(&mut sheets[si], x0, y0, size as u32, [70, 74, 84], 1);
+            }
+            // Thin dark lines, found at twice the size and marked cyan on the wire sheet.
+            let big = sc::attach_cam(center, v, half);
+            let (hits, mask) = sc::thin_lines(&model, &textures, &pose, big, 2 * size, clip, wb_core::render::Filter::Smooth, line_dip, 3);
+            let x0 = label_w + (k * size) as u32;
+            for (i, &on) in mask.iter().enumerate() {
+                if on {
+                    let (x, y) = ((i % (2 * size)) / 2, (i / (2 * size)) / 2);
+                    sheets[1].put_pixel(x0 + x as u32, y0 + y as u32, image::Rgba([0, 230, 255, 255]));
+                }
+            }
+            for h in hits {
+                let e = lines.entry(h.tri).or_insert((0, 0, [f32::MAX; 2], [f32::MIN; 2], 0.0, 0.0, 0.0));
+                e.0 += h.pixels;
+                e.1 += 1;
+                for q in 0..2 {
+                    e.2[q] = e.2[q].min(h.uv_lo[q]);
+                    e.3[q] = e.3[q].max(h.uv_hi[q]);
+                }
+                e.4 += h.texel_luma * h.pixels as f32;
+                e.5 += h.screen_luma * h.pixels as f32;
+                e.6 += h.around_luma * h.pixels as f32;
+            }
+        }
+        pose_json.push(json!({
+            "pose": name,
+            "region_tris": rep.region_tris.len(),
+            "open_edges": rep.open_edges.iter().map(|&(a, b)| json!([gp[a as usize], gp[b as usize]])).collect::<Vec<_>>(),
+            "cracks": rep.cracks.iter().map(|&(e, f)| json!({"edge": [gp[e.0 as usize], gp[e.1 as usize]], "along": [gp[f.0 as usize], gp[f.1 as usize]]})).collect::<Vec<_>>(),
+            "intersections": rep.intersections.iter().map(|&(a, b)| json!([label_of(a), label_of(b)])).collect::<Vec<_>>(),
+            "texture_seams": strong.iter().map(|s| json!({
+                "edge": [gp[s.edge.0 as usize], gp[s.edge.1 as usize]],
+                "color_jump": s.color_jump,
+                "tris": s.tris.iter().map(|&t| label_of(t)).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        }));
+        if let Some((rm, ..)) = &reference {
+            let rclip = ci.and_then(|c| rm.clips.iter().position(|x| x == &model.clips[c]));
+            if ci.is_none() || rclip.is_some() {
+                prot_poses.push((name.clone(), rm.posed(rclip, *t), pose.clone()));
+            }
+        }
+    }
+    for (si, s) in sheets.iter().enumerate() {
+        let p = out_dir.join(format!("attach-{}.png", names[si]));
+        s.save(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        println!("  wrote {}", p.display());
+    }
+    let mut lv: Vec<_> = lines.into_iter().collect();
+    lv.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    let line_label = |t: u32| -> String {
+        let (mi, ti) = wb_core::render::split_id(&model, t as usize);
+        let s = ts[mi][ti];
+        format!("{}:{} ({})", mi, ti, if s < sh.len() { sh[s].label.as_str() } else { "?" })
+    };
+    println!("thin dark lines (cyan on the wire sheet), by triangle over all poses and views:");
+    for (t, (n, views, lo, hi, tl, sl, al)) in lv.iter().take(12) {
+        let n1 = *n as f32;
+        println!(
+            "      {}: {n} px in {views} views; uv {:.4},{:.4}..{:.4},{:.4}; luma texel {:.2}, screen {:.2}, around {:.2}",
+            line_label(*t), lo[0], lo[1], hi[0], hi[1], tl / n1, sl / n1, al / n1
+        );
+    }
+    let lines_json: Vec<Value> = lv.iter().take(40).map(|(t, (n, views, lo, hi, tl, sl, al))| {
+        let n1 = *n as f32;
+        json!({"tri": line_label(*t), "pixels": n, "views": views, "uv_lo": lo, "uv_hi": hi, "texel_luma": tl / n1, "screen_luma": sl / n1, "around_luma": al / n1})
+    }).collect();
+    let mut prot_json = Value::Null;
+    if let Some((rm, rsh, rs, rb, protect, rtop)) = &reference {
+        let (v, worst_surf, worst_off) = sc::protected_violations(rm, &rsh[*rs], &rsh[*rb], protect, &model, &sh[strap], &sh[body], &prot_poses, protect_tol);
+        println!(
+            "protected: {} points over {} poses; farthest from the new strap {:.4}, most stand-off lost {:.4}; {} violations over {protect_tol}",
+            protect.len(),
+            prot_poses.len(),
+            worst_surf,
+            worst_off,
+            v.len()
+        );
+        let rmesh = &rm.meshes[rsh[*rs].mesh];
+        for x in v.iter().take(10) {
+            println!("      {} {:.4} at reference vertex {} ({:.3} below its top), {}", x.kind, x.amount, x.point, rtop - rmesh.pos[x.point][1], x.pose);
+        }
+        prot_json = json!({
+            "protect_from": protect_from, "tolerance": protect_tol, "points": protect.len(), "poses": prot_poses.len(),
+            "farthest_from_new_strap": worst_surf, "most_standoff_lost": worst_off, "violations": v.len(),
+            "worst": v.iter().take(50).map(|x| json!({"kind": x.kind, "vertex": x.point, "below_top": rtop - rmesh.pos[x.point][1], "pose": x.pose, "amount": x.amount})).collect::<Vec<_>>(),
+        });
+    }
+    let j = json!({
+        "file": path.display().to_string(), "strap_shell": sh[strap].label, "waist_shell": sh[body].label,
+        "views": ATTACH_VIEWS.iter().map(|v| json!({"name": v.name, "yaw_deg": v.yaw_deg, "pitch_deg": v.pitch_deg})).collect::<Vec<_>>(),
+        "half_height": half, "seam_jump": seam_jump, "thin_lines": lines_json, "poses": pose_json, "protected": prot_json,
+    });
+    let p = out_dir.join("strap-check.json");
+    std::fs::write(&p, serde_json::to_string_pretty(&j).unwrap()).map_err(|e| format!("{}: {e}", p.display()))?;
+    println!("  wrote {}", p.display());
+    Ok(())
+}
+
+/// `line-repaint FILE.glb --out NEW.glb --uv u0,v0,u1,v1 [--dip D] [--reach N] [--image NAME]
+/// [--pad N --pad-uv u0,v0,u1,v1 --pad-slack S]`:
+/// repaints thin dark horizontal lines inside a UV box of one texture (by default the strap
+/// mesh's), blending each line run from the texels above and below it. With `--pad N`, it then
+/// grows the UV islands N texels into the texels no triangle samples inside the `--pad-uv` box
+/// (default: the `--uv` box), so filtering at an island edge stops pulling in the gutter color.
+/// Only that image's bytes change; `swap` checks every other buffer view and the JSON.
+pub fn line_repaint_cmd(args: &Args) -> Result<(), String> {
+    let path = file_args(args).into_iter().next().ok_or("line-repaint needs FILE.glb")?;
+    let out = PathBuf::from(args.opt("--out").ok_or("line-repaint needs --out NEW.glb")?);
+    if out == path {
+        return Err("--out must differ from the source".into());
+    }
+    let parse_box = |name: &str, s: &str| -> Result<Vec<f32>, String> {
+        let v: Vec<f32> = s.split(',').map(|x| x.trim().parse::<f32>().map_err(|e| format!("{name} {x}: {e}"))).collect::<Result<_, _>>()?;
+        if v.len() != 4 {
+            return Err(format!("{name} wants u0,v0,u1,v1"));
+        }
+        Ok(v)
+    };
+    let uv = parse_box("--uv", args.opt("--uv").ok_or("line-repaint needs --uv u0,v0,u1,v1")?)?;
+    let pad_uv = match args.opt("--pad-uv") {
+        Some(s) => parse_box("--pad-uv", s)?,
+        None => uv.clone(),
+    };
+    let pad: usize = num(args, "--pad", 0)?;
+    // 0: a texel counts as sampled only when its center is inside a triangle. Edge texels whose
+    // center lies just outside still get sampled by nearest/bilinear lookups, so they must be padded.
+    let pad_slack: f32 = num(args, "--pad-slack", 0.0)?;
+    let dip: f32 = num(args, "--dip", 0.12)?;
+    let reach: usize = num(args, "--reach", 4)?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let model = Model::from_bytes(&bytes)?;
+    let ii = match args.opt("--image") {
+        Some(n) => model.images.iter().position(|i| i.name.trim_end_matches(".png") == n.trim_end_matches(".png")).ok_or_else(|| format!("no image {n}"))?,
+        None => {
+            let sh = shells::find(&model);
+            let (strap, _) = pick_shells(&sh, args)?;
+            model.meshes[sh[strap].mesh].image.ok_or("the strap mesh has no texture")?
+        }
+    };
+    let textures = wb_core::image_textures(&model);
+    let tex = textures.get(ii).and_then(|t| t.as_ref()).ok_or("texture did not decode")?;
+    let (w, h) = (tex.w, tex.h);
+    let to_rect = |b: &[f32]| {
+        [
+            (b[0].min(b[2]) * w as f32).floor().max(0.0) as usize,
+            (b[1].min(b[3]) * h as f32).floor().max(0.0) as usize,
+            ((b[0].max(b[2]) * w as f32).ceil() as usize).min(w),
+            ((b[1].max(b[3]) * h as f32).ceil() as usize).min(h),
+        ]
+    };
+    let rect = to_rect(&uv);
+    let mut rgba = tex.rgba.clone();
+    let (changed, rows) = wb_core::strapcheck::repaint_thin_lines(&mut rgba, w, h, rect, dip, reach);
+    println!("{}: image {} ({w}x{h}), texels {}..{} x {}..{}: {changed} line texels repainted", path.display(), model.images[ii].name, rect[0], rect[2], rect[1], rect[3]);
+    for (y, n) in &rows {
+        println!("    row {y} (v {:.5}): {n}", (*y as f32 + 0.5) / h as f32);
+    }
+    let mut padded = 0;
+    if pad > 0 {
+        let pr = to_rect(&pad_uv);
+        let cov = wb_core::strapcheck::uv_coverage(&model, ii, w, h, pr, pad_slack);
+        let used = cov.iter().filter(|&&c| c).count();
+        padded = wb_core::strapcheck::pad_uv_islands(&mut rgba, w, pr, &cov, pad);
+        println!("padding: texels {}..{} x {}..{}: {used} of {} sampled by a triangle (slack {pad_slack} texel); {padded} unsampled texels changed over {pad} rings", pr[0], pr[2], pr[1], pr[3], cov.len());
+    }
+    if changed == 0 && padded == 0 {
+        return Err("no line texels found and nothing padded; nothing written".into());
+    }
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbaImage::from_raw(w as u32, h as u32, rgba).ok_or("bad image size")?.write_to(&mut png, image::ImageFormat::Png).map_err(|e| e.to_string())?;
+    let sw = wb_core::swap::swap(&model, &model.images[ii].name, &png.into_inner())?;
+    std::fs::write(&out, &sw.bytes).map_err(|e| format!("{}: {e}", out.display()))?;
+    println!("check: only image {} changed (other buffer views and JSON verified by swap)", sw.image);
+    println!("wrote {} ({} bytes)", out.display(), sw.bytes.len());
     Ok(())
 }

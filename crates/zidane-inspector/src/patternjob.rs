@@ -252,7 +252,7 @@ fn manifest(model: &Model, lay: &pattern::Layout, o: &Options, input: &Path, out
     let id = "id = R + 256 G + 65536 B; alpha 255 where a triangle covers the texel, 0 elsewhere (id 0 = no surface)";
     Ok(json!({
         "revision": 8,
-        "tool": "zidane-inspector pattern (Rust, no Blender)",
+        "tool": "gaw pattern (Rust, no Blender)",
         "scope": "UV sewing-pattern layout of the input model; not installed in the game",
         "source": { "file": input.file_name().map(|n| n.to_string_lossy().into_owned()), "sha256": sha256(&src) },
         "output": glb,

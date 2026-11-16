@@ -32,7 +32,7 @@ Today it is built and tested on Final Fantasy IX character GLB exports. The GLB,
 | ![Inspect: one model next to its texture with part usage](docs/screenshots/inspect.png) | ![Mark & fix: a marked area on the model and the texture, with a note for the AI](docs/screenshots/mark-and-fix.png) |
 | *Inspect: the belt band selected, with Touch and Reuse on. Teal triangles share pixels with the band, and colored texture areas are mirrored, shared or folded.* | *Mark & fix: 66 triangles marked with the soft brush and a note typed. The Marked card counts them by part.* |
 
-All three screenshots are real captures of the window, taken with `zidane-inspector view ... --screenshot` on a hidden desktop. Nothing is a mockup.
+All three screenshots are real captures of the window, taken with `gaw view ... --screenshot` on a hidden desktop. Nothing is a mockup.
 
 ## Build
 
@@ -44,7 +44,7 @@ cd game-asset-workbench
 cargo build --release
 ```
 
-The program is `target/release/zidane-inspector` (`.exe` on Windows). The first build downloads the libraries (egui, wgpu, image, rfd, spade) and takes a few minutes. The binary keeps the name `zidane-inspector` because the first character it was written for was Zidane.
+The program is `target/release/gaw` (`.exe` on Windows). The first build downloads the libraries (egui, wgpu, image, rfd, spade) and takes a few minutes. A second small program, `zidane-inspector`, is the old name: it runs `gaw` from the same folder with the same arguments. The crate folder is still `crates/zidane-inspector`.
 
 Run `cargo test --release` for the tests. Tests that need a local FF9 export skip themselves when the file is missing.
 
@@ -52,16 +52,16 @@ Run `cargo test --release` for the tests. Tests that need a local FF9 export ski
 
 ```bash
 # Open the window on Compare
-zidane-inspector
+gaw
 
 # Compare two GLBs in the terminal
-zidane-inspector compare original.glb candidate.glb
+gaw compare original.glb candidate.glb
 
 # Open Inspect on one file with a part selected, and save a screenshot of the window
-zidane-inspector view candidate.glb --part belt-band --touch --reuse --screenshot inspect.png
+gaw view candidate.glb --part belt-band --touch --reuse --screenshot inspect.png
 
 # Make a sewing-pattern UV layout (no Blender)
-zidane-inspector pattern character.glb --out-dir NEW_FOLDER --size 4096
+gaw pattern character.glb --out-dir NEW_FOLDER --size 4096
 ```
 
 Keys in the window: Space plays or pauses, 1/2/3 pick field, battle or close-up, F/B/S turn the camera, D toggles dead triangles, C toggles changes, T and U toggle Touch and Reuse on Inspect, Ctrl+O opens a file, F1 opens Help.
@@ -88,7 +88,7 @@ Keys in the window: Space plays or pauses, 1/2/3 pick field, battle or close-up,
 | `roundtrip --out copy.glb` | Write the file back from its parsed parts and check it matches the input |
 | `render --out view.png` | Save the model view and texture without opening a window |
 
-Run `zidane-inspector help` for every option. Add `--json` to most commands for machine-readable output.
+Run `gaw help` for every option. Add `--json` to most commands for machine-readable output.
 
 ## How the comparison works
 

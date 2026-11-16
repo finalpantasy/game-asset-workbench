@@ -1,4 +1,4 @@
-//! `zidane-inspector bake`: render guide views of a GLB, register painted pictures of those views,
+//! `gaw bake`: render guide views of a GLB, register painted pictures of those views,
 //! and bake the paint onto the texture atlas through the triangles that show it (wb-core `bake`).
 //!
 //!   bake in.glb --step guide    --out-dir NEW --view front --view back [--size 1024]

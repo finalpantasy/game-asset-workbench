@@ -1,4 +1,4 @@
-//! `zidane-inspector ship`: PNG sheets to Memoria raw-header textures (DXT1 / DXT5 / RGBA32 with a
+//! `gaw ship`: PNG sheets to Memoria raw-header textures (DXT1 / DXT5 / RGBA32 with a
 //! full mip chain), written at the same `.png` file name. The encoder and header code are in
 //! `wb_core::unitytex`. Inputs are only read; outputs go to a new folder and never replace a file
 //! unless `--force` is given.
@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use wb_core::unitytex::{self as ut, Format, MipOpts, ShipOpts};
 
-pub const SHIP_USAGE: &str = "  zidane-inspector ship SHEET.png [SHEET2.png ...] --out-dir NEW_FOLDER [options]
+pub const SHIP_USAGE: &str = "  gaw ship SHEET.png [SHEET2.png ...] --out-dir NEW_FOLDER [options]
       Writes each sheet as a Memoria raw texture at the same .png name: the 60-byte header (width,
       height, dataLength, Unity TextureFormat, mip count) and a full mip chain, rows flipped to
       Unity's bottom-left origin. The game loads it with no PNG decode and no run-time mip build.

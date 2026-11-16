@@ -52,6 +52,21 @@ pub struct Params {
     pub columns: usize,
     /// How far inside the edge the side walls sample the paint, as a share of the strap's width.
     pub wall_inset: f32,
+    /// Side walls get their own narrow strip of the strap's leather paint, at the front face's
+    /// texel scale both along the wall and across its thickness (false: the v2 walls, which repeat
+    /// one texel across the thickness and show stretched stripes).
+    pub wall_strip: bool,
+    /// Tightest bend allowed in the attachment curve, in world units (0 = the v2 profile). The
+    /// curve runs from `tuck_depth` behind the waist, through the exit, to where the card hangs,
+    /// as two cubics that meet at the exit with matching slope and curvature, so there is no
+    /// crease or shelf there. The hidden part lengthens past `tuck_len` until no bend is tighter
+    /// than this.
+    pub bend_radius: f32,
+    /// Strap width through the attachment (from the top to the end of the exit lift): negative =
+    /// the width of the first row below the lift, held constant above it; 0 = follow the paint,
+    /// which narrows at the top of some cards and pinches the exit; positive = this world width.
+    /// The paint is still sampled inside its opaque extent, so no transparent texels show.
+    pub attach_width: f32,
     /// Frames per clip for the ride-part weight fit (0 = blend the waist triangle's weights).
     pub fit_frames: usize,
     /// Joints of waist vertices this close to a point are candidates in the fit.
@@ -109,6 +124,9 @@ impl Default for Params {
             thigh_joint: 20,
             columns: 12,
             wall_inset: 0.33,
+            wall_strip: true,
+            bend_radius: 0.015,
+            attach_width: -1.0,
             fit_frames: 24,
             fit_reach: 0.10,
             exit_by_paint: true,
@@ -746,13 +764,44 @@ pub fn build(model: &Model, card: &Shell, body: &Shell, p: &Params) -> Result<Bu
     let c = p.columns.max(2);
     // Front grid in UV, inset a quarter texel from the paint edge.
     let mut grid: Vec<Vec<[f32; 2]>> = Vec::new();
+    // Texture coordinates per grid point: the same as `grid` except where `attach_width` moves the
+    // geometry; there the paint is still sampled inside its own opaque extent.
+    let mut grid_tex: Vec<Vec<[f32; 2]>> = Vec::new();
+    let attach_w_uv = if p.attach_width < 0.0 {
+        extent(d_of_a(tuck_end), uc).map(|(l, h)| h - l)
+    } else if p.attach_width > 0.0 {
+        let (l, h) = extent(d_of_a(tuck_end), uc).ok_or("no paint at the end of the exit lift")?;
+        let ww = geom::dist(map.pos(m, [l, v_top(l) + d_of_a(tuck_end)]), map.pos(m, [h, v_top(h) + d_of_a(tuck_end)])).max(1e-6);
+        Some(p.attach_width * (h - l) / ww)
+    } else {
+        None
+    };
+    let (mut aw_lo, mut aw_hi) = (f32::MAX, f32::MIN);
     for &d in &rows_d {
         let (l, h) = extent(d, uc).ok_or_else(|| format!("no paint on row {d}"))?;
         let (l, h) = (l + 0.25 * texel, h - 0.25 * texel);
+        let (gl, gh) = match attach_w_uv {
+            Some(w) if a_of_d(d) < tuck_end - 1e-4 => {
+                aw_lo = aw_lo.min(h - l);
+                aw_hi = aw_hi.max(h - l);
+                let mid = 0.5 * (l + h);
+                (mid - 0.5 * (w - 0.5 * texel), mid + 0.5 * (w - 0.5 * texel))
+            }
+            _ => (l, h),
+        };
         grid.push((0..=c).map(|k| {
+            let u = gl + (gh - gl) * k as f32 / c as f32;
+            [u, v_top(u) + d]
+        }).collect());
+        grid_tex.push((0..=c).map(|k| {
             let u = l + (h - l) * k as f32 / c as f32;
             [u, v_top(u) + d]
         }).collect());
+    }
+    if let Some(w) = attach_w_uv {
+        if aw_lo <= aw_hi {
+            log.push(format!("attachment width held at {:.4} UV (paint there {:.4}..{:.4}) from the top to the end of the exit lift", w, aw_lo, aw_hi));
+        }
     }
     let tip_uv = [uc, v_top(uc) + tip_d - 0.25 * texel];
     log.push(format!(
@@ -910,6 +959,8 @@ pub fn build(model: &Model, card: &Shell, body: &Shell, p: &Params) -> Result<Bu
         Some((out, before, after))
     };
     let (mut min_gap, mut tucked) = (f32::MAX, 0usize);
+    // Attachment curve: longest hidden length, tightest hidden and visible bend, steepest exit angle.
+    let mut bend_stats = (0.0f32, f32::MAX, f32::MAX, 0.0f32, 0.0f32);
     let mut point = |uv: [f32; 2], d: f32| -> Pt {
         let a = a_of_d(d);
         let mut pos = map.pos(m, uv);
@@ -923,7 +974,46 @@ pub fn build(model: &Model, card: &Shell, body: &Shell, p: &Params) -> Result<Bu
         let e = exit_at(uv[0]);
         let t1 = e + p.lift_len;
         let hang = gap.max(p.clear_gap);
-        let want = if a < e - p.tuck_len {
+        let want = if p.bend_radius > 0.0 {
+            // Two cubics meeting at the exit with the same slope m1 and curvature: the hidden one
+            // from -tuck_depth (flat) up to the surface, the visible one from the surface out to
+            // the hang gap (flat). Second derivatives are linear in each, so the tightest bend of
+            // each is at one of its ends.
+            let (d1, l2, d2) = (p.tuck_depth, p.lift_len, hang);
+            let m1_of = |l1: f32| 1.5 * (d1 / (l1 * l1) + d2 / (l2 * l2)) / (1.0 / l1 + 1.0 / l2);
+            let k1_of = |l1: f32| {
+                let m1 = m1_of(l1);
+                (6.0 * d1 / (l1 * l1) - 2.0 * m1 / l1).abs().max((4.0 * m1 / l1 - 6.0 * d1 / (l1 * l1)).abs())
+            };
+            let mut l1 = p.tuck_len;
+            while k1_of(l1) > 1.0 / p.bend_radius && l1 < 0.12 {
+                l1 += 0.001;
+            }
+            let m1 = m1_of(l1);
+            let k2 = (6.0 * d2 / (l2 * l2) - 4.0 * m1 / l2).abs().max((6.0 * d2 / (l2 * l2) - 2.0 * m1 / l2).abs());
+            if a < t1 {
+                bend_stats.0 = bend_stats.0.max(l1);
+                bend_stats.1 = bend_stats.1.min(1.0 / k1_of(l1).max(1e-6));
+                bend_stats.2 = bend_stats.2.min(1.0 / k2.max(1e-6));
+                bend_stats.3 = bend_stats.3.max(m1.atan().to_degrees());
+                bend_stats.4 = bend_stats.4.max(d2);
+            }
+            if a < e - l1 {
+                Some(-d1)
+            } else if a < e {
+                let x = a - (e - l1);
+                let (b, c3) = (3.0 * d1 / (l1 * l1) - m1 / l1, m1 / (l1 * l1) - 2.0 * d1 / (l1 * l1 * l1));
+                Some(-d1 + b * x * x + c3 * x * x * x)
+            } else if a < t1 {
+                let y = t1 - a;
+                let (b, c3) = (3.0 * d2 / (l2 * l2) - m1 / l2, m1 / (l2 * l2) - 2.0 * d2 / (l2 * l2 * l2));
+                Some(d2 - (b * y * y + c3 * y * y * y))
+            } else if gap < p.clear_gap {
+                Some(p.clear_gap)
+            } else {
+                None
+            }
+        } else if a < e - p.tuck_len {
             Some(-p.tuck_depth)
         } else if a < e {
             Some(-p.tuck_depth * (1.0 - smoothstep((a - (e - p.tuck_len)) / p.tuck_len)))
@@ -968,6 +1058,11 @@ pub fn build(model: &Model, card: &Shell, body: &Shell, p: &Params) -> Result<Bu
     }
     let mut front_pts: Vec<Vec<Pt>> = grid.iter().zip(&rows_d).map(|(row, &d)| row.iter().map(|&uv| point(uv, d)).collect()).collect();
     let mut tip_pt = point(tip_uv, tip_d);
+    for (row, trow) in front_pts.iter_mut().zip(&grid_tex) {
+        for (pt, &tuv) in row.iter_mut().zip(trow) {
+            pt.uv = tuv;
+        }
+    }
 
     // Thigh clearance: per row, top to tip, the smallest left/right thigh shares (never falling
     // toward the tip) that keep the row's front and back points out of the body in the frames.
@@ -1180,6 +1275,12 @@ pub fn build(model: &Model, card: &Shell, body: &Shell, p: &Params) -> Result<Bu
         log.push(format!("thigh clearance over {} frames: {}", frames.len(), if shown.is_empty() { "every row clear".into() } else { shown.join(", ") }));
     }
     log.push(format!("{tucked} front points tucked behind the waist; smallest gap below the tuck {:.4}", min_gap));
+    if p.bend_radius > 0.0 {
+        log.push(format!(
+            "attachment curve: hidden part up to {:.3} long (tightest bend radius {:.4}), visible lift {:.3} (tightest bend radius {:.4}), exit angle up to {:.1} deg, hang gap at the lift end up to {:.4}; one curve, no crease at the exit",
+            bend_stats.0, bend_stats.1, p.lift_len, bend_stats.2, bend_stats.3, bend_stats.4
+        ));
+    }
     if fit_n > 0 {
         log.push(format!(
             "weight fit over {} frames: {} points, mean RMS miss from the waist point (normal part counted {FIT_NORMAL_WEIGHT}x) {:.4} with blended weights, {:.4} fitted",
@@ -1359,11 +1460,25 @@ pub fn build(model: &Model, card: &Shell, body: &Shell, p: &Params) -> Result<Bu
     let nring = ring.len();
     // Wall UV: the point's UV moved toward the strap's middle line.
     let inset = p.wall_inset * full_w;
-    let wall_uv = |pt: &Pt| -> [f32; 2] {
+    // Texture scale of the front face (UV per world unit across the middle row), so a wall strip
+    // across the thickness covers as much paint as the same distance on the front.
+    let uv_per_m = {
+        let r = rows / 2;
+        let (gl, gh) = (grid_tex[r][0][0], grid_tex[r][c][0]);
+        (gh - gl).abs() / geom::dist(front_pts[r][0].pos, front_pts[r][c].pos).max(1e-6)
+    };
+    // Wall UV at the front edge and at the back edge: the point's UV moved toward the strap's
+    // middle line, then (with wall_strip) on by the thickness at the front's scale.
+    let wall_uv = |pt: &Pt| -> ([f32; 2], [f32; 2]) {
         let toward = [uc - pt.uv[0], 0.5 * (v_top(uc) + v_top(uc) + 0.5 * tip_d) - pt.uv[1]];
         let l = (toward[0] * toward[0] + toward[1] * toward[1]).sqrt().max(1e-9);
         let s = inset.min(l * 0.5);
-        [pt.uv[0] + toward[0] / l * s, pt.uv[1] + toward[1] / l * s]
+        let f = [pt.uv[0] + toward[0] / l * s, pt.uv[1] + toward[1] / l * s];
+        if !p.wall_strip {
+            return (f, f);
+        }
+        let sb = (pt.th * uv_per_m).min((l - s).max(0.0));
+        (f, [f[0] + toward[0] / l * sb, f[1] + toward[1] / l * sb])
     };
     let mut wf = Vec::with_capacity(nring);
     let mut wb = Vec::with_capacity(nring);
@@ -1378,9 +1493,9 @@ pub fn build(model: &Model, card: &Shell, body: &Shell, p: &Params) -> Result<Bu
         if geom::dot(out, geom::sub(pt.pos, midp)) < 0.0 {
             out = geom::scale(out, -1.0);
         }
-        let uv = wall_uv(pt);
-        wf.push(push(&mut verts, &mut meta, pt, pt.pos, out, uv, "wall"));
-        wb.push(push(&mut verts, &mut meta, pt, back_of(pt), out, uv, "wall"));
+        let (uf, ub) = wall_uv(pt);
+        wf.push(push(&mut verts, &mut meta, pt, pt.pos, out, uf, "wall"));
+        wb.push(push(&mut verts, &mut meta, pt, back_of(pt), out, ub, "wall"));
     }
     // Wall winding: outward normal.
     for i in 0..nring {

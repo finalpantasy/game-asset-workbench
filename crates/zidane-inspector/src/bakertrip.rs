@@ -1,4 +1,4 @@
-//! `zidane-inspector bake STOCK.glb --step roundtrip --pattern PATTERN.glb --out-dir NEW`
+//! `gaw bake STOCK.glb --step roundtrip --pattern PATTERN.glb --out-dir NEW`
 //!
 //! A round trip with a known right answer. Stock renders of a model (stock UVs and textures) are
 //! upscaled with a plain resampler and baked onto a re-laid-out copy of the same model (pattern

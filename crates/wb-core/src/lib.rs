@@ -18,6 +18,7 @@ pub mod unitytex;
 pub mod geom;
 pub mod shells;
 pub mod strap;
+pub mod strapcheck;
 pub mod sweep;
 pub mod hair;
 pub mod hair_model;

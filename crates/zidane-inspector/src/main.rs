@@ -1,4 +1,4 @@
-//! zidane-inspector: command line and window. Inputs are opened read-only.
+//! gaw: command line and window. Inputs are opened read-only.
 mod app;
 mod bakejob;
 mod doc;
@@ -24,9 +24,9 @@ use wb_core::{image_textures, model_textures, Model};
 pub const STOCK: &str = r"E:\SteamLibrary\steamapps\common\FINAL FANTASY IX\Modding\exports\Zidane-idle.glb";
 pub const KIT_PARTS: &str = r"E:\SteamLibrary\steamapps\common\FINAL FANTASY IX\Modding\experiments\zidane-uv-kit-claude-v1\parts";
 
-const USAGE: &str = "zidane-inspector: open an FF9 character export (GLB) read-only
+const USAGE: &str = "gaw (Game Asset Workbench, formerly zidane-inspector): open a character export (GLB) read-only
 
-  zidane-inspector [view] [file.glb] [--parts DIR] [--part NAME] [--screenshot out.png]
+  gaw [view] [file.glb] [--parts DIR] [--part NAME] [--screenshot out.png]
       Opens the window. With a file it opens Inspect, without one it opens Compare.
       Window options: --page inspect|compare|swap|mark, --a FILE, --b FILE, --clip NAME, --time SEC,
       --size field|battle|close, --advanced, --changes, --dead, --tol N.
@@ -34,22 +34,22 @@ const USAGE: &str = "zidane-inspector: open an FF9 character export (GLB) read-o
       --screenshot saves the window when loading is done and closes it.
       Mark & fix page: --page mark [--mark-script FILE] runs scripted marks, strokes and saves
       (one command per line, see workbench/README.md) and --requests-dir DIR saves requests there.
-  zidane-inspector compare a.glb b.glb [--tol N] [--json]
+  gaw compare a.glb b.glb [--tol N] [--json]
       What changed from A to B: pixels per texture (and per kit part), meshes, skeleton, clips.
-  zidane-inspector report [file.glb] [--json] [--coverage SIZE]
+  gaw report [file.glb] [--json] [--coverage SIZE]
       Counts: triangles, data arrays, joints, clips, dead triangles by region,
       and with --coverage, unused texels per texture at SIZE (the kit uses 4096).
-  zidane-inspector uv [file.glb] [--part NAME] [--json]
+  gaw uv [file.glb] [--part NAME] [--json]
       UV islands (kit label, triangles, side, mirror twin, pixel density at the texture size),
       texels that show on two surfaces (at 1024), and with --part, what its pixels touch.
-  zidane-inspector swap [file.glb] --image 98_1 --png painted.png --out new.glb [--json]
+  gaw swap [file.glb] --image 98_1 --png painted.png --out new.glb [--json]
       Safe swap: writes a new file where only that texture changed, checks that every other
       byte block is identical, and says which parts the new paint shows on. Never overwrites.
-  zidane-inspector relayout [file.glb] --out-dir NEW_FOLDER [--size 4096] [--blender PATH] [--json]
+  gaw relayout [file.glb] --out-dir NEW_FOLDER [--size 4096] [--blender PATH] [--json]
       New unique UV layout (Blender, in the background) with the old paint copied across, then
       checks: same skeleton, clips and triangles, no texel on two surfaces, and renders from four
       sides that match the input. Writes checks.json. --check done.glb only runs the checks.
-  zidane-inspector pattern [file.glb] --out-dir NEW_FOLDER [--size 4096] [--json]
+  gaw pattern [file.glb] --out-dir NEW_FOLDER [--size 4096] [--json]
       Sewing-pattern UV layout, all built in (no Blender): pieces cut by body part, flattened,
       turned upright, left/right pairs side by side, face and hands at higher density, paint
       copied across. Also writes a pattern sheet with numbered seams, part/position/normal maps
@@ -70,25 +70,36 @@ const USAGE: &str = "zidane-inspector: open an FF9 character export (GLB) read-o
                                       (default: the sheet size, at most 2048). The layout stays the same.
       --low-stretch[=X]               relax pieces whose anisotropy p95 is above X (default 2.0) and cut those
                                       that stay above; the target joins the pattern checks. --v9 = --v8 + this.
-  zidane-inspector bake [file.glb] --step guide|register|bake|demo --out-dir NEW_FOLDER
+  gaw bake [file.glb] --step guide|register|bake|demo --out-dir NEW_FOLDER
       Paint-projection bake onto the texture atlas. guide: --view front|back|left|right|NAME=yaw,pitch
       (repeatable) [--size 1024 --ortho --clip C --time T] writes NAME-guide.png, -ids.png, -depth.png,
       -view.json. register: --view-dir DIR --paint NAME=painted.png aligns the picture to the guide
       and refuses a bad scale. bake: the same plus --mask-part torso,arm --mask-mesh NAME
       --mask-png SHEET=mask.png --gate N --pad N --no-seam --leak-check writes the baked model,
       atlases, change maps, sheets, bake-report.json and FINAL-VERIFICATION.json. demo: self-test.
-  zidane-inspector roundtrip [file.glb] --out copy.glb
+  gaw roundtrip [file.glb] --out copy.glb
       Writes the file back from its parsed parts and checks it equals the input byte for byte.
-  zidane-inspector render [file.glb] --out view.png [--part NAME] [--dead] [--yaw DEG] [--size PX] [--clip NAME --time SEC]
+  gaw render [file.glb] --out view.png [--part NAME] [--dead] [--yaw DEG] [--size PX] [--clip NAME --time SEC]
       Saves the model view and the texture side by side, with the part highlighted.
-  zidane-inspector shells [file.glb] [--json-out report.json]
+  gaw shells [file.glb] [--json-out report.json]
       Lists each connected piece of every mesh: closed or open, thickness, bones, nearest piece
       (edges passing through it count as contact), skin mismatch and LOOSE / LOOSE CARD status.
-  zidane-inspector strap-rebuild [file.glb] --out new.glb [--no-collide] [--no-paint-exit]
+  gaw strap-rebuild [file.glb] --out new.glb [--no-collide] [--no-paint-exit]
       Replaces the flat belt-strap card with a solid strap tucked under the waistband.
       Exit: from the waist paint by default, or --exit-edge V,V.. / --exit-curve x,y,z;.. /
       --exit-down D,D.. (across the strap); --exit-raise M lifts it; --flip-root picks the other end.
-  zidane-inspector strap-sweep before.glb after.glb --out-dir DIR [--labels a,b] [--clips ..] [--times ..] [--size PX]
+      Attachment: --bend-radius R (tightest bend, 0 = v2 profile), --attach-width W (-1 = first row below
+      the lift, 0 = follow the paint), --thickness T; --v2-walls keeps the old one-texel wall UVs.
+  gaw strap-check file.glb --out-dir DIR [--reference ref.glb] [--clips ..] [--times ..] [--size PX] [--half H]
+      Strap-root close-ups (front, both sides, both 3/4, underside) at rest and in clips: plain, wireframe and
+      depth sheets with intersections, cracks, open edges and texture seams named by triangle; --reference
+      also checks the protected part of a reference strap (--protect-from D, --protect-tol T).
+      --center-down D centers the views D below the strap top; --clip-front M drops what lies M in front of it.
+  gaw line-repaint file.glb --out new.glb --uv u0,v0,u1,v1 [--dip D] [--reach N] [--image NAME]
+      Repaints thin dark horizontal lines in a UV box of one texture from the texels above and below them;
+      only that image changes. --pad N grows the UV islands N texels into unsampled texels of the
+      --pad-uv box (default: the --uv box), so filtering at an island edge stops showing the gutter.
+  gaw strap-sweep before.glb after.glb --out-dir DIR [--labels a,b] [--clips ..] [--times ..] [--size PX]
       Close-up sheets of the strap through each clip, with attachment flags and notes.
 
 file.glb defaults to the stock export; --parts defaults to the UV kit's parts folder.";
@@ -146,7 +157,7 @@ fn main() {
     let all: Vec<String> = std::env::args().skip(1).collect();
     let (cmd, rest) = match all.first().map(String::as_str) {
         Some(c @ ("report" | "roundtrip" | "render" | "compare" | "uv" | "swap" | "relayout" | "pattern" | "view" | "help" | "-h" | "--help")) => (c.to_owned(), all[1..].to_vec()),
-        Some(c @ ("shells" | "strap-sweep" | "strap-rebuild")) => (c.to_owned(), all[1..].to_vec()),
+        Some(c @ ("shells" | "strap-sweep" | "strap-rebuild" | "strap-check" | "line-repaint")) => (c.to_owned(), all[1..].to_vec()),
         Some(c @ "bake") => (c.to_owned(), all[1..].to_vec()),
         Some(c @ "hair") => (c.to_owned(), all[1..].to_vec()),
         Some(c @ "judge") => (c.to_owned(), all[1..].to_vec()),
@@ -186,6 +197,8 @@ fn main() {
         "shells" => strapcmd::shells_cmd(&args),
         "strap-sweep" => strapcmd::sweep_cmd(&args),
         "strap-rebuild" => strapcmd::rebuild_cmd(&args),
+        "strap-check" => strapcmd::check_cmd(&args),
+        "line-repaint" => strapcmd::line_repaint_cmd(&args),
         "view" => app::run(&args),
         _ => {
             println!("{USAGE}");

@@ -268,7 +268,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         mark: markpage::Mark::from_args(args)?,
     };
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1600.0, 940.0]).with_min_inner_size([1100.0, 640.0]).with_title("Zidane Workbench"),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1600.0, 940.0]).with_min_inner_size([1100.0, 640.0]).with_title("Game Asset Workbench"),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };

@@ -1,4 +1,4 @@
-//! `zidane-inspector hair`: hair texturing from parameters (see `wb_core::hair`).
+//! `gaw hair`: hair texturing from parameters (see `wb_core::hair`).
 //!
 //! Game-agnostic: point it at any GLB, sheet and hair selection. FF9-only details are options
 //! (`--keep-blink` for field Zidane's eye-blink boxes, the UV kit's part map for `--part`).
@@ -11,7 +11,7 @@ use wb_core::hair::{self, BakeIn, Chart, Flow, FlowOpts, HairSet, JoinIn, JoinKi
 use wb_core::render::{self, Camera, Filter};
 use wb_core::{font, image_textures, Model, Texture};
 
-pub const HAIR_USAGE: &str = "  zidane-inspector hair file.glb --out-dir NEW_FOLDER [options]
+pub const HAIR_USAGE: &str = "  gaw hair file.glb --out-dir NEW_FOLDER [options]
       Retextures hair cards from parameters: flow field, strand-aligned UVs, strand synthesizer,
       checks (flow across joins, Lab across joins, fringe at every mip, duplicate faces) and
       turntable sheets. Options: --sheet NAME (98_0), --mesh NAME, --part NAME [--parts DIR]

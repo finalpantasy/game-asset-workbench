@@ -1,5 +1,5 @@
 //! Workbench requests: what a person marked on a model or texture, and what they want, saved as a
-//! folder any AI session can read without the window (`zidane-inspector requests show latest`).
+//! folder any AI session can read without the window (`gaw requests show latest`).
 //!
 //! A request folder holds `request.json` (source file, note, marked triangles per mesh, a texel mask
 //! PNG per sheet, edge loops as vertex ids and positions, camera, clip and time), a screenshot with
@@ -19,13 +19,13 @@ use wb_core::Texture;
 pub const REQUESTS_DIR: &str = r"E:\SteamLibrary\steamapps\common\FINAL FANTASY IX\Modding\workbench\requests";
 pub const MODDING: &str = r"E:\SteamLibrary\steamapps\common\FINAL FANTASY IX\Modding";
 
-pub const REQUESTS_USAGE: &str = "  zidane-inspector requests [list] [--dir DIR] [--json]
+pub const REQUESTS_USAGE: &str = "  gaw requests [list] [--dir DIR] [--json]
       Lists the saved workbench requests (newest first): kind, note, what was marked.
-  zidane-inspector requests show NAME|latest|PATH [--json]
+  gaw requests show NAME|latest|PATH [--json]
       Prints one request: the note, the source file, the marked triangles by part, edge loops,
       texel masks and every file in the folder. --json prints request.json itself.
       Requests are saved from the window's Mark & fix page (\"Save request\", \"Fix my edit\").
-  zidane-inspector requests locks NAME|latest|PATH FILE.glb
+  gaw requests locks NAME|latest|PATH FILE.glb
       Checks FILE.glb (an edit or an AI fix) against the places the request locked. Exits 1 and
       lists them when any moved.";
 
@@ -531,15 +531,15 @@ pub fn save(r: ReqInput) -> Result<Saved, String> {
         "edge_loops": loops,
         "edits": edits,
         "locked": locked_json(&r),
-        "saved_views": {"file": crate::viewscmd::views_file().display().to_string(), "names": crate::viewscmd::load_views(&crate::viewscmd::views_file()).iter().map(|v| v.name.clone()).collect::<Vec<_>>(), "render": "zidane-inspector views render FILE.glb --out-dir DIR"},
+        "saved_views": {"file": crate::viewscmd::views_file().display().to_string(), "names": crate::viewscmd::load_views(&crate::viewscmd::views_file()).iter().map(|v| v.name.clone()).collect::<Vec<_>>(), "render": "gaw views render FILE.glb --out-dir DIR"},
         "files": files,
         "how_to_read": {
-            "triangles": "Indices into each mesh's triangle list (indices accessor / 3), meshes in file order (glTF mesh, then primitive). Same numbering as zidane-inspector and wb_core::Model.",
+            "triangles": "Indices into each mesh's triangle list (indices accessor / 3), meshes in file order (glTF mesh, then primitive). Same numbering as gaw and wb_core::Model.",
             "weights": "Soft-brush strength per listed triangle, 0..1 (absent when all are 1).",
             "texel_masks": "Grayscale PNG at the sheet's full size: 255 = fully marked, 0 = not. Covers the marked triangles' texels plus marks drawn on the texture view.",
             "edge_loops": "Each point is one place on the surface: its bind-pose position and every mesh vertex there (UV seams and back faces give several). Consecutive points share a mesh edge.",
             "screenshot": "screenshot.png: marked triangles orange with a white outline, edge loops cyan. screenshot-clean.png: the same view without marks.",
-            "cli": "zidane-inspector requests show <folder> prints this request.",
+            "cli": "gaw requests show <folder> prints this request.",
         },
     });
     let mut j = j;
@@ -569,7 +569,7 @@ fn locked_json(r: &ReqInput) -> Value {
     json!({
         "count": places.len(),
         "tolerance": r.topo.height * 1e-4,
-        "about": "Places that must not move. Check a candidate with: zidane-inspector requests locks <this folder> FILE.glb",
+        "about": "Places that must not move. Check a candidate with: gaw requests locks <this folder> FILE.glb",
         "places": places,
     })
 }
