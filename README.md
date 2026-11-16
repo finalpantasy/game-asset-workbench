@@ -1,8 +1,10 @@
-# FF9 HD Character Workbench
+# Game Asset Workbench (GAW)
 
-**Final Fantasy IX character texture and UV tools for HD mods (Memoria engine), written in Rust.**
+**Rust tools that AI assistants and people use to remaster 3D game assets: models, UVs and textures. Final Fantasy IX (Memoria engine) is the first game it supports.**
 
-Compare two versions of a character model, find every pixel and vertex that changed, unwrap a model onto a clean sewing-pattern UV layout, and check an HD retexture before it goes near the game. It is a Cargo workspace with a command-line tool and a native egui/wgpu window, built for Final Fantasy IX character GLB exports first. The GLB, UV and texture code is generic, so it can be reused for other games.
+Compare two versions of a model, find every pixel and vertex that changed, unwrap it onto a clean sewing-pattern UV layout, and check an HD retexture before it goes near the game. Every tool runs from the command line and writes plain files and JSON, so an AI assistant can drive it, read the results and fix its own mistakes. People get a native egui/wgpu window for the same tools, including a page for marking what is wrong so the AI knows where to look.
+
+Today it is built and tested on Final Fantasy IX character GLB exports. The GLB, UV, render and texture code has nothing FF9-specific in it, and the goal is every kind of asset in any game: characters, props and scenes.
 
 ![Compare: two versions of a character side by side, with the changed pixels marked on the texture](docs/screenshots/compare.png)
 
@@ -37,8 +39,8 @@ All three screenshots are real captures of the window, taken with `zidane-inspec
 You need a recent stable Rust toolchain (edition 2021) and a GPU driver that supports wgpu (DirectX 12, Vulkan or Metal). The window has only been run on Windows 11.
 
 ```bash
-git clone https://github.com/finalpantasy/ff9-hd-character-workbench.git
-cd ff9-hd-character-workbench
+git clone https://github.com/finalpantasy/game-asset-workbench.git
+cd game-asset-workbench
 cargo build --release
 ```
 

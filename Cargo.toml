@@ -7,10 +7,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 # Repo name lives here; swap it in one place (see PUBLISH-PLAN.md).
-repository = "https://github.com/finalpantasy/ff9-hd-character-workbench"
-homepage = "https://github.com/finalpantasy/ff9-hd-character-workbench"
+repository = "https://github.com/finalpantasy/game-asset-workbench"
+homepage = "https://github.com/finalpantasy/game-asset-workbench"
 readme = "README.md"
-keywords = ["final-fantasy-ix", "uv-unwrap", "gltf", "texture", "modding"]
+keywords = ["game-assets", "uv-unwrap", "gltf", "texture", "modding"]
 categories = ["game-development", "graphics", "command-line-utilities"]
 publish = false
 
