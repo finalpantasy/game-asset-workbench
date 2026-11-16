@@ -1,0 +1,13 @@
+# Build output
+target/
+
+# Run output
+out/
+logs/
+requests/
+
+# Game and model data never belongs in this repo
+*.glb
+*.gltf
+*.fbx
+*.bin

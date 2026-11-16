@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/wb-core", "crates/zidane-inspector"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+# Repo name lives here; swap it in one place (see PUBLISH-PLAN.md).
+repository = "https://github.com/finalpantasy/ff9-hd-character-workbench"
+homepage = "https://github.com/finalpantasy/ff9-hd-character-workbench"
+readme = "README.md"
+keywords = ["final-fantasy-ix", "uv-unwrap", "gltf", "texture", "modding"]
+categories = ["game-development", "graphics", "command-line-utilities"]
+publish = false
+
+[workspace.dependencies]
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Dependencies build optimized even in debug, so the viewer stays usable.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+debug = false

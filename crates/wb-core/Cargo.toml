@@ -1,0 +1,16 @@
+[package]
+name = "wb-core"
+description = "Read-only GLB model core for the FF9 asset workbench: parsing, byte-exact writing, mesh checks, a CPU renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+image.workspace = true
+spade = "2.15"
