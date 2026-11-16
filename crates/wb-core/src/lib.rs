@@ -19,6 +19,7 @@ pub mod geom;
 pub mod shells;
 pub mod strap;
 pub mod strapcheck;
+pub mod boundary;
 pub mod sweep;
 pub mod hair;
 pub mod hair_model;

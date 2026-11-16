@@ -13,6 +13,7 @@ mod judgecmd;
 mod shipcmd;
 mod requestcmd;
 mod viewscmd;
+mod boundarycmd;
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -99,6 +100,14 @@ const USAGE: &str = "gaw (Game Asset Workbench, formerly zidane-inspector): open
       Repaints thin dark horizontal lines in a UV box of one texture from the texels above and below them;
       only that image changes. --pad N grows the UV islands N texels into unsampled texels of the
       --pad-uv box (default: the --uv box), so filtering at an island edge stops showing the gutter.
+  gaw boundary-check a.glb [b.glb ..] --out-dir DIR (--center x,y,z | --shell LABEL [--down D]) [--views front,back,..]
+      [--filters texels,smooth,distance] [--materials name=r,g,b;..] [--probe x,y]
+      Labels each thin line or speck in the views: uv seam, clothing edge, intentional overlap, accidental paint
+      mark, silhouette or unknown; lists which piece lies over which; renders under texel, smooth and
+      gameplay-distance filtering.
+  gaw paint-fix file.glb --out new.glb --op marks|edge|seams|pad --uv u0,v0,u1,v1 --materials .. (--center | --shell)
+      Paint edits that keep intentional overlaps (and, for marks and seams, clothing edges) untouched and check
+      the overlap order; writes a before/after/changed sheet. Only the texture changes.
   gaw strap-sweep before.glb after.glb --out-dir DIR [--labels a,b] [--clips ..] [--times ..] [--size PX]
       Close-up sheets of the strap through each clip, with attachment flags and notes.
 
@@ -157,7 +166,7 @@ fn main() {
     let all: Vec<String> = std::env::args().skip(1).collect();
     let (cmd, rest) = match all.first().map(String::as_str) {
         Some(c @ ("report" | "roundtrip" | "render" | "compare" | "uv" | "swap" | "relayout" | "pattern" | "view" | "help" | "-h" | "--help")) => (c.to_owned(), all[1..].to_vec()),
-        Some(c @ ("shells" | "strap-sweep" | "strap-rebuild" | "strap-check" | "line-repaint")) => (c.to_owned(), all[1..].to_vec()),
+        Some(c @ ("shells" | "strap-sweep" | "strap-rebuild" | "strap-check" | "line-repaint" | "boundary-check" | "paint-fix")) => (c.to_owned(), all[1..].to_vec()),
         Some(c @ "bake") => (c.to_owned(), all[1..].to_vec()),
         Some(c @ "hair") => (c.to_owned(), all[1..].to_vec()),
         Some(c @ "judge") => (c.to_owned(), all[1..].to_vec()),
@@ -199,6 +208,8 @@ fn main() {
         "strap-rebuild" => strapcmd::rebuild_cmd(&args),
         "strap-check" => strapcmd::check_cmd(&args),
         "line-repaint" => strapcmd::line_repaint_cmd(&args),
+        "boundary-check" => boundarycmd::check_cmd(&args),
+        "paint-fix" => boundarycmd::fix_cmd(&args),
         "view" => app::run(&args),
         _ => {
             println!("{USAGE}");

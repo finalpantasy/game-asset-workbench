@@ -11,3 +11,6 @@ requests/
 *.gltf
 *.fbx
 *.bin
+
+# Private local notes for the gaw skill
+skills/gaw/local/

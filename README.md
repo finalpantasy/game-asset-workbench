@@ -34,6 +34,12 @@ Today it is built and tested on Final Fantasy IX character GLB exports. The GLB,
 
 All three screenshots are real captures of the window, taken with `gaw view ... --screenshot` on a hidden desktop. Nothing is a mockup.
 
+## Using it with an AI assistant
+
+`skills/gaw/` is a skill for Claude Code and Codex. It tells the assistant which command to use for a job, the order to run them in, and what never to do. Flags come from `gaw help`, so the skill doesn't go stale. To install it, link or copy `skills/gaw` into your skills folder (`~/.claude/skills/gaw` for Claude Code, `~/.agents/skills/gaw` for Codex).
+
+Changing gaw? Update `skills/gaw` in the same change; `skills/gaw/MAINTAINING.md` says how. `cargo test -p zidane-inspector --test skill_coverage` fails when a command in `gaw help` is missing from the skill.
+
 ## Build
 
 You need a recent stable Rust toolchain (edition 2021) and a GPU driver that supports wgpu (DirectX 12, Vulkan or Metal). The window has only been run on Windows 11.
