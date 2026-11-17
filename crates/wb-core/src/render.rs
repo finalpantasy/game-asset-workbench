@@ -54,6 +54,22 @@ impl Camera {
         self.ortho_half *= f;
     }
 
+    /// Screen position (x, y in pixels of a `w` by `h` frame) and camera depth of a world point,
+    /// the same projection `render` uses.
+    pub fn project(&self, w: usize, h: usize, p: [f32; 3]) -> [f32; 3] {
+        let (eye, f, r, u) = self.basis();
+        let d = sub(p, eye);
+        let z = dot(d, f);
+        let (cx, cy) = (0.5 * w as f32, 0.5 * h as f32);
+        if self.ortho {
+            let s = 0.5 * h as f32 / self.ortho_half.max(1e-6);
+            [cx + s * dot(d, r), cy - s * dot(d, u), z]
+        } else {
+            let focal = 0.5 * h as f32 / (self.fov_y * 0.5).tan();
+            [cx + focal * dot(d, r) / z, cy - focal * dot(d, u) / z, z]
+        }
+    }
+
     fn basis(&self) -> ([f32; 3], [f32; 3], [f32; 3], [f32; 3]) {
         let (cp, sp, cy, sy) = (self.pitch.cos(), self.pitch.sin(), self.yaw.cos(), self.yaw.sin());
         let eye = [self.target[0] + self.dist * cp * sy, self.target[1] + self.dist * sp, self.target[2] + self.dist * cp * cy];

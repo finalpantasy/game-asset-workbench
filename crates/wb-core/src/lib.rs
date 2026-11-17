@@ -23,10 +23,14 @@ pub mod boundary;
 pub mod sweep;
 pub mod hair;
 pub mod hair_model;
+pub mod hairfiber;
 pub mod perceptual;
 pub mod golden;
 pub mod edit;
 pub mod strands;
+pub mod defects;
+pub mod hairlook;
+pub mod fbx;
 
 pub use model::Model;
 

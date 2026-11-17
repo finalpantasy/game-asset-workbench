@@ -111,6 +111,8 @@ pub struct ReqInput {
     pub after_glb: Option<Vec<u8>>,
     /// Per weld group: locked on the Mark & fix page (empty = none).
     pub locked: Vec<bool>,
+    /// Extra JSON files for the folder (strokes.json, defects.json), listed under "attached".
+    pub attach: Vec<(String, Value)>,
 }
 
 pub struct Saved {
@@ -504,6 +506,12 @@ pub fn save(r: ReqInput) -> Result<Saved, String> {
         files.push("screenshot-before.png".into());
     }
 
+    let mut attached: Vec<Value> = vec![];
+    for (name, v) in &r.attach {
+        std::fs::write(dir.join(name), serde_json::to_string_pretty(v).unwrap()).map_err(|e| format!("{name}: {e}"))?;
+        files.push(name.clone());
+        attached.push(json!({"file": name, "kind": v.as_object().and_then(|o| o.keys().find(|k| k.starts_with("gaw_") || k.starts_with("workbench_")).cloned()), "count": v["strokes"].as_array().or(v["defects"].as_array()).map(|a| a.len())}));
+    }
     let prompt = format!("Look at workbench request {}", dir.display());
     let j = json!({
         "workbench_request": 1,
@@ -531,6 +539,7 @@ pub fn save(r: ReqInput) -> Result<Saved, String> {
         "edge_loops": loops,
         "edits": edits,
         "locked": locked_json(&r),
+        "attached": attached,
         "saved_views": {"file": crate::viewscmd::views_file().display().to_string(), "names": crate::viewscmd::load_views(&crate::viewscmd::views_file()).iter().map(|v| v.name.clone()).collect::<Vec<_>>(), "render": "gaw views render FILE.glb --out-dir DIR"},
         "files": files,
         "how_to_read": {
@@ -594,6 +603,7 @@ fn clone_input(r: &ReqInput) -> ReqInput {
         symmetry: r.symmetry,
         after_glb: None,
         locked: r.locked.clone(),
+        attach: r.attach.clone(),
     }
 }
 
@@ -904,6 +914,9 @@ fn print_request(dir: &Path, j: &Value) {
         println!("  edits    {} places moved, up to {} units ({})", e["moved_places"], e["max_move"], if by_part.is_empty() { "none".into() } else { by_part.join(", ") });
         println!("           painted: {}", if painted.is_empty() { "nothing".into() } else { painted.join(", ") });
         println!("           before.glb, after.glb: {}", e["what_to_do"].as_str().unwrap_or(""));
+    }
+    for a in j["attached"].as_array().into_iter().flatten() {
+        println!("  attached {} ({} {})", a["file"].as_str().unwrap_or(""), a["count"], match a["kind"].as_str() { Some("gaw_strokes") => "comb strokes", Some("gaw_defects" | "workbench_defects") => "defects", _ => "items" });
     }
     println!("  files");
     for f in j["files"].as_array().into_iter().flatten() {

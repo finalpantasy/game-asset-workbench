@@ -10,9 +10,9 @@ use wb_core::render::{self, Camera, Filter};
 use wb_core::shells;
 use wb_core::Model;
 
-const OWN_VALUE_OPTS: [&str; 39] = [
+const OWN_VALUE_OPTS: [&str; 40] = [
     "--y", "--clip", "--out", "--out-dir", "--center", "--shell", "--down", "--half", "--views", "--size", "--filters", "--distance-px", "--materials", "--max-dist", "--dip", "--reach", "--probe",
-    "--op", "--uv", "--of", "--on", "--max", "--search", "--upper", "--lower", "--window", "--move", "--band", "--blur", "--min-jump", "--pad", "--protect-views", "--min-mark", "--min-crease", "--keep-uv", "--mark-uv", "--seam-uv", "--reclaim", "--reclaim-tol",
+    "--op", "--uv", "--of", "--on", "--max", "--search", "--upper", "--lower", "--window", "--move", "--band", "--blur", "--min-jump", "--pad", "--protect-views", "--min-mark", "--min-crease", "--keep-uv", "--mark-uv", "--seam-uv", "--reclaim", "--reclaim-tol", "--highlight-hue",
 ];
 
 fn files(args: &Args) -> Vec<PathBuf> {
@@ -201,7 +201,7 @@ fn crossings(l: &Loaded, pose: &[Vec<[f32; 3]>], cam: &Camera, size: usize, clip
 }
 
 fn label_params<'a>(args: &Args, pal: &'a [Material]) -> Result<LabelParams<'a>, String> {
-    Ok(LabelParams { dip: num(args, "--dip", 0.12)?, reach: num(args, "--reach", 3)?, layer_gap: 0.003, seam_jump: 12.0, palette: pal, max_dist: num(args, "--max-dist", 60.0)?, min_mark_px: num(args, "--min-mark", 12)?, min_crease_px: num(args, "--min-crease", 40)? })
+    Ok(LabelParams { dip: num(args, "--dip", 0.12)?, reach: num(args, "--reach", 3)?, layer_gap: 0.003, seam_jump: 12.0, palette: pal, max_dist: num(args, "--max-dist", 60.0)?, min_mark_px: num(args, "--min-mark", 12)?, min_crease_px: num(args, "--min-crease", 40)?, highlight_hue: num(args, "--highlight-hue", 10.0)? })
 }
 
 /// The main texture of the model: the image used by the most triangles.
@@ -258,7 +258,8 @@ fn parse_views(args: &Args, default: &str) -> Result<Vec<(String, f32, f32)>, St
 
 /// `boundary-check A.glb [B.glb ...] --out-dir DIR (--center x,y,z | --shell LABEL [--down D])
 /// [--half H] [--views front,back,...] [--size PX] [--filters texels,smooth,distance]
-/// [--distance-px N] [--materials name=r,g,b;...] [--probe x,y]`
+/// [--distance-px N] [--materials name=r,g,b;...] [--probe x,y]
+/// [--min-mark PX] [--min-crease PX] [--highlight-hue DEG]`
 pub fn check_cmd(args: &Args) -> Result<(), String> {
     let paths = files(args);
     if paths.is_empty() {

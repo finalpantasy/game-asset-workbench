@@ -1017,11 +1017,92 @@ pub struct LabelParams<'a> {
     /// contact shadows (an overlap drawn into the paint, such as a strap passing under a loop):
     /// they become Overlap so edits leave them alone. 0 turns this off.
     pub min_crease_px: usize,
+    /// A light stroke whose paint has the hue of the paint on both sides within this many degrees
+    /// (and keeps at least 40% of its saturation) is a painted highlight or specular band, a
+    /// lighter shade of the same paint: it becomes Unknown, not a mark. Only for colored paint
+    /// (saturation 0.2 or more beside it); grey paint has no stable hue. 0 turns this off.
+    pub highlight_hue: f32,
 }
 
 const SPILL: &str = "a different material painted inside one material";
+const HIGHLIGHT: &str = "painted highlight: a lighter shade of the same paint";
+
+/// Hue in degrees (0..360) and saturation (0..1) of an RGB color.
+fn hue_sat(c: [f32; 3]) -> (f32, f32) {
+    let (mx, mn) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
+    let d = mx - mn;
+    if mx <= 0.0 || d <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let h = if mx == c[0] {
+        60.0 * ((c[1] - c[2]) / d).rem_euclid(6.0)
+    } else if mx == c[1] {
+        60.0 * ((c[2] - c[0]) / d + 2.0)
+    } else {
+        60.0 * ((c[0] - c[1]) / d + 4.0)
+    };
+    (h, d / mx)
+}
+
+/// True when `here` is a lighter shade of `side`: same hue within `tol` degrees, at least 40% of
+/// the saturation, brighter, and `side` is colored enough to have a hue.
+pub fn is_highlight(here: [f32; 3], side: [f32; 3], tol: f32) -> bool {
+    let (hh, hs) = hue_sat(here);
+    let (sh, ss) = hue_sat(side);
+    let dh = (hh - sh).abs();
+    let dh = dh.min(360.0 - dh);
+    tol > 0.0 && ss >= 0.2 && hs >= 0.4 * ss && dh <= tol && here.iter().sum::<f32>() > side.iter().sum::<f32>()
+}
 const GRAIN: &str = "grain-size stroke inside one material";
 const CREASE: &str = "long painted crease or contact shadow (painted overlap)";
+
+/// A highlight component (8-connected) that touches a spill is the spill's soft edge: texels
+/// blended between the spill and the paint around it have the paint's hue. It joins the spill as
+/// a mark.
+fn halo_to_spill(out: &mut [Labeled], w: usize, h: usize) {
+    let mut at = vec![usize::MAX; w * h];
+    for (i, l) in out.iter().enumerate() {
+        if l.why == HIGHLIGHT || l.why == SPILL {
+            at[l.y * w + l.x] = i;
+        }
+    }
+    let mut seen = vec![false; out.len()];
+    for s in 0..out.len() {
+        if out[s].why != HIGHLIGHT || seen[s] {
+            continue;
+        }
+        let (mut comp, mut stack, mut touches) = (vec![s], vec![s], false);
+        seen[s] = true;
+        while let Some(i) = stack.pop() {
+            let (x, y) = (out[i].x as i64, out[i].y as i64);
+            for dy in -1..=1i64 {
+                for dx in -1..=1i64 {
+                    let (nx, ny) = (x + dx, y + dy);
+                    if nx < 0 || ny < 0 || nx >= w as i64 || ny >= h as i64 {
+                        continue;
+                    }
+                    let j = at[ny as usize * w + nx as usize];
+                    if j == usize::MAX || seen[j] {
+                        continue;
+                    }
+                    if out[j].why == SPILL {
+                        touches = true;
+                    } else {
+                        seen[j] = true;
+                        comp.push(j);
+                        stack.push(j);
+                    }
+                }
+            }
+        }
+        if touches {
+            for i in comp {
+                out[i].kind = Kind::PaintMark;
+                out[i].why = SPILL;
+            }
+        }
+    }
+}
 
 /// Sorts same-material PaintMark components (8-connected) by size: smaller than min_px is grain
 /// (Unknown); dark and at least crease_px is a painted crease (Overlap). Spills stay marks.
@@ -1091,6 +1172,11 @@ pub fn label_lines(model: &Model, tex: &Texture, image: usize, g: &GBuffer, rgba
     let tl = |uv: [f32; 2]| {
         let (x, y) = texel_of(tex.w, tex.h, uv);
         luma(&tex.rgba[(y * tex.w + x) * 4..])
+    };
+    let trgb = |uv: [f32; 2]| -> [f32; 3] {
+        let (x, y) = texel_of(tex.w, tex.h, uv);
+        let o = (y * tex.w + x) * 4;
+        [tex.rgba[o] as f32, tex.rgba[o + 1] as f32, tex.rgba[o + 2] as f32]
     };
     let tmat = |uv: [f32; 2]| -> u8 {
         let (x, y) = texel_of(tex.w, tex.h, uv);
@@ -1194,8 +1280,20 @@ pub fn label_lines(model: &Model, tex: &Texture, image: usize, g: &GBuffer, rgba
                     kind = Some(Kind::ClothingEdge);
                     why = "the paint changes material across the line";
                 } else if painted {
-                    kind = Some(Kind::PaintMark);
-                    why = if mats.first().is_some_and(|&m| m != here_mat && here_mat != UNKNOWN) { SPILL } else { "a stroke painted inside one material" };
+                    let spill = mats.first().is_some_and(|&m| m != here_mat && here_mat != UNKNOWN);
+                    // Mean paint on the two sides, to tell a highlight band from a foreign stroke.
+                    let side_rgb = {
+                        let qs: Vec<[f32; 3]> = [a, b].iter().flatten().map(|q| trgb(q.uv)).collect();
+                        let n = qs.len().max(1) as f32;
+                        [0, 1, 2].map(|c| qs.iter().map(|v| v[c]).sum::<f32>() / n)
+                    };
+                    if light && !spill && is_highlight(trgb(hit.uv), side_rgb, p.highlight_hue) {
+                        kind = Some(Kind::Unknown);
+                        why = HIGHLIGHT;
+                    } else {
+                        kind = Some(Kind::PaintMark);
+                        why = if spill { SPILL } else { "a stroke painted inside one material" };
+                    }
                 } else {
                     kind = Some(Kind::Unknown);
                     why = "not in the paint at this texel (shading or filtering)";
@@ -1205,6 +1303,7 @@ pub fn label_lines(model: &Model, tex: &Texture, image: usize, g: &GBuffer, rgba
             out.push(Labeled { x: x as usize, y: y as usize, light, kind: kind.unwrap(), hit, texel: (tx, ty), why });
         }
     }
+    halo_to_spill(&mut out, w, h);
     classify_strokes(&mut out, w, h, p.min_mark_px, p.min_crease_px);
     out
 }
@@ -1281,5 +1380,27 @@ pub fn texel_density(model: &Model, mesh: usize, tris: &[usize], tw: usize, th: 
         per_m_min: per.first().copied().unwrap_or(0.0),
         per_m_max: per.last().copied().unwrap_or(0.0),
         across: med * span,
+    }
+}
+
+#[cfg(test)]
+mod highlight_tests {
+    use super::is_highlight;
+
+    #[test]
+    fn leather_highlight_is_not_a_mark() {
+        // Light band on the front belt leather (texels near 4420,6537).
+        assert!(is_highlight([246.0, 196.0, 140.0], [184.0, 120.0, 63.0], 10.0));
+    }
+
+    #[test]
+    fn foreign_strokes_stay_marks() {
+        // Shirt-colored speck and greenish stray pad paint on leather.
+        assert!(!is_highlight([164.0, 159.0, 140.0], [150.0, 91.0, 41.0], 10.0));
+        assert!(!is_highlight([166.0, 153.0, 105.0], [150.0, 91.0, 41.0], 10.0));
+        // Grey paint has no stable hue; darker is never a highlight; 0 turns the test off.
+        assert!(!is_highlight([220.0, 214.0, 213.0], [184.0, 178.0, 177.0], 10.0));
+        assert!(!is_highlight([120.0, 78.0, 40.0], [184.0, 120.0, 63.0], 10.0));
+        assert!(!is_highlight([246.0, 196.0, 140.0], [184.0, 120.0, 63.0], 0.0));
     }
 }

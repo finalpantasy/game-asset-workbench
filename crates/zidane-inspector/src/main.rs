@@ -10,10 +10,14 @@ mod viewport;
 mod strapcmd;
 mod haircmd;
 mod judgecmd;
+mod defectscmd;
+mod gatecmd;
+mod closelookcmd;
 mod shipcmd;
 mod requestcmd;
 mod viewscmd;
 mod boundarycmd;
+mod fbxcmd;
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -104,19 +108,24 @@ const USAGE: &str = "gaw (Game Asset Workbench, formerly zidane-inspector): open
       [--filters texels,smooth,distance] [--materials name=r,g,b;..] [--probe x,y]
       Labels each thin line or speck in the views: uv seam, clothing edge, intentional overlap, accidental paint
       mark, silhouette or unknown; lists which piece lies over which; renders under texel, smooth and
-      gameplay-distance filtering.
+      gameplay-distance filtering. Label tuning: --min-mark PX (smaller same-paint strokes are grain, 12),
+      --min-crease PX (longer dark strokes are painted creases, 40; 0 off), --highlight-hue DEG (a light
+      stroke within DEG of the paint beside it is a painted highlight, not a mark, 10; 0 off).
   gaw paint-fix file.glb --out new.glb --op marks|edge|seams|pad --uv u0,v0,u1,v1 --materials .. (--center | --shell)
+      [--protect-views v,..] [--keep-uv box;..] (marks: --on MAT, plus --mark-uv box;.. or --of MAT to find them)
+      [--seam-uv box;box] (seams) [--pad N --reclaim N --reclaim-tol T] (pad) and the label tuning flags above.
       Paint edits that keep intentional overlaps (and, for marks and seams, clothing edges) untouched and check
-      the overlap order; writes a before/after/changed sheet. Only the texture changes.
+      the overlap order; writes a before/after/changed sheet. Only the texture changes. --reclaim N repaints
+      up to N island-edge texels that do not match the paint inside them (a dotted line along a UV seam).
   gaw strap-sweep before.glb after.glb --out-dir DIR [--labels a,b] [--clips ..] [--times ..] [--size PX]
       Close-up sheets of the strap through each clip, with attachment flags and notes.
 
 file.glb defaults to the stock export; --parts defaults to the UV kit's parts folder.";
 
-const VALUE_OPTS: [&str; 28] = [
+const VALUE_OPTS: [&str; 30] = [
     "--out", "--part", "--parts", "--size", "--yaw", "--screenshot", "--coverage", "--pitch", "--click-model", "--page", "--a", "--b", "--clip", "--time", "--tol", "--region",
     "--texture", "--image", "--png", "--out-dir", "--blender", "--check", "--relayout", "--keep-stock",
-    "--mark-script", "--requests-dir", "--dir", "--names",
+    "--mark-script", "--requests-dir", "--dir", "--names", "--geo-id", "--scale",
 ];
 
 pub struct Args(Vec<String>);
@@ -170,9 +179,12 @@ fn main() {
         Some(c @ "bake") => (c.to_owned(), all[1..].to_vec()),
         Some(c @ "hair") => (c.to_owned(), all[1..].to_vec()),
         Some(c @ "judge") => (c.to_owned(), all[1..].to_vec()),
+        Some(c @ "defects") => (c.to_owned(), all[1..].to_vec()),
+        Some(c @ ("gate" | "closelook")) => (c.to_owned(), all[1..].to_vec()),
         Some(c @ "ship") => (c.to_owned(), all[1..].to_vec()),
         Some(c @ "requests") => (c.to_owned(), all[1..].to_vec()),
         Some(c @ "views") => (c.to_owned(), all[1..].to_vec()),
+        Some(c @ "fbx") => (c.to_owned(), all[1..].to_vec()),
         // A word that is not a file is a mistyped command: say so instead of opening the window.
         Some(c) if !c.starts_with("--") && !Path::new(c).exists() => ("help".to_owned(), vec![]),
         _ => ("view".to_owned(), all.clone()),
@@ -182,9 +194,13 @@ fn main() {
         println!("{USAGE}");
         println!("{}", haircmd::HAIR_USAGE);
         println!("{}", judgecmd::JUDGE_USAGE);
+        println!("{}", defectscmd::DEFECTS_USAGE);
+        println!("{}", gatecmd::GATE_USAGE);
+        println!("{}", closelookcmd::CLOSELOOK_USAGE);
         println!("{}", shipcmd::SHIP_USAGE);
         println!("{}", requestcmd::REQUESTS_USAGE);
         println!("{}", viewscmd::VIEWS_USAGE);
+        println!("{}", fbxcmd::FBX_USAGE);
         std::process::exit(2);
     }
     let args = Args(rest);
@@ -198,9 +214,13 @@ fn main() {
         "bake" => bakejob::bake_cmd(&args),
         "hair" => haircmd::hair_cmd(&args),
         "judge" => judgecmd::judge_cmd(&args),
+        "defects" => defectscmd::defects_cmd(&args),
+        "gate" => gatecmd::gate_cmd(&args),
+        "closelook" => closelookcmd::closelook_cmd(&args),
         "ship" => shipcmd::ship_cmd(&args),
         "requests" => requestcmd::requests_cmd(&args),
         "views" => viewscmd::views_cmd(&args),
+        "fbx" => fbxcmd::fbx_cmd(&args),
         "roundtrip" => roundtrip(&args),
         "render" => render_cmd(&args),
         "shells" => strapcmd::shells_cmd(&args),
@@ -215,9 +235,13 @@ fn main() {
             println!("{USAGE}");
             println!("{}", haircmd::HAIR_USAGE);
             println!("{}", judgecmd::JUDGE_USAGE);
+        println!("{}", defectscmd::DEFECTS_USAGE);
+        println!("{}", gatecmd::GATE_USAGE);
+        println!("{}", closelookcmd::CLOSELOOK_USAGE);
         println!("{}", shipcmd::SHIP_USAGE);
             println!("{}", requestcmd::REQUESTS_USAGE);
             println!("{}", viewscmd::VIEWS_USAGE);
+            println!("{}", fbxcmd::FBX_USAGE);
             Ok(())
         }
     };

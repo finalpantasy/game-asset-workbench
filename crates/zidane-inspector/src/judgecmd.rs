@@ -107,11 +107,11 @@ fn save_rgb(path: &Path, im: &Rgb) -> Result<(), String> {
 // ---------- regions ----------
 
 /// Region name for every triangle, by global triangle id (see `render::tri_offsets`).
-struct Labels {
-    names: Vec<String>,
-    tri: Vec<u16>,
-    shape: Vec<usize>,
-    source: &'static str,
+pub(crate) struct Labels {
+    pub(crate) names: Vec<String>,
+    pub(crate) tri: Vec<u16>,
+    pub(crate) shape: Vec<usize>,
+    pub(crate) source: &'static str,
 }
 
 pub(crate) fn bone_group(bone: &str) -> String {
@@ -140,7 +140,7 @@ fn weapon_name(mesh: &str) -> Option<String> {
     mesh.strip_prefix("battle_model").map(|s| format!("weapon{}", s.split('#').next().unwrap_or("")))
 }
 
-fn labels_for(model: &Model, parts: Option<&Parts>) -> Labels {
+pub(crate) fn labels_for(model: &Model, parts: Option<&Parts>) -> Labels {
     let shape: Vec<usize> = model.meshes.iter().map(|m| m.tris.len()).collect();
     let kit_ok = parts.is_some_and(|p| (0..model.meshes.len()).all(|mi| model.meshes[mi].image.is_none() || p.map_for(&model.atlas_name(mi)).is_some()));
     let mut names: Vec<String> = Vec::new();
@@ -793,7 +793,11 @@ fn is_blond_px(px: &[u8]) -> bool {
 
 /// Hair triangles per mesh: on a head bone (unless --any-bone) and painted blond at 4 of 7 points.
 fn hair_flags(a: &A, model: &Model, tex: &[Option<wb_core::Texture>]) -> Vec<Vec<bool>> {
-    let any_bone = a.flag("--any-bone");
+    hair_flags_for(a.flag("--any-bone"), model, tex)
+}
+
+/// Hair triangles per mesh (see `hair_flags`); `tex` is per mesh (`model_textures`).
+pub(crate) fn hair_flags_for(any_bone: bool, model: &Model, tex: &[Option<wb_core::Texture>]) -> Vec<Vec<bool>> {
     model
         .meshes
         .iter()

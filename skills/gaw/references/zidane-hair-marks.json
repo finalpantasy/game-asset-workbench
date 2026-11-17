@@ -1,0 +1,77 @@
+{
+ "about": "The nine marks from experiments/zidane-hair-tool-v3/close-look-coordinator.png, in pixels of gaw defects' 768 px orbit views (cameras fitted to the stock hair). x, y is the centre, r the radius.",
+ "marks": [
+  {
+   "id": 1,
+   "name": "widow's peak (flat wedge)",
+   "view": "orbit_y000",
+   "x": 382,
+   "y": 233,
+   "r": 83
+  },
+  {
+   "id": 2,
+   "name": "specks by cheek",
+   "view": "orbit_y000",
+   "x": 561,
+   "y": 427,
+   "r": 40
+  },
+  {
+   "id": 3,
+   "name": "shards at tips",
+   "view": "orbit_y000",
+   "x": 210,
+   "y": 398,
+   "r": 49
+  },
+  {
+   "id": 4,
+   "name": "shards over ear",
+   "view": "orbit_y090",
+   "x": 350,
+   "y": 345,
+   "r": 63
+  },
+  {
+   "id": 5,
+   "name": "holes over cheek (stipple)",
+   "view": "orbit_y090",
+   "x": 264,
+   "y": 473,
+   "r": 57
+  },
+  {
+   "id": 6,
+   "name": "blur, back",
+   "view": "orbit_y180",
+   "x": 385,
+   "y": 372,
+   "r": 125
+  },
+  {
+   "id": 7,
+   "name": "direction cut",
+   "view": "orbit_y270",
+   "x": 293,
+   "y": 375,
+   "r": 68
+  },
+  {
+   "id": 8,
+   "name": "specks by ear",
+   "view": "orbit_y270",
+   "x": 521,
+   "y": 446,
+   "r": 48
+  },
+  {
+   "id": 9,
+   "name": "smear, upper side",
+   "view": "orbit_y090",
+   "x": 407,
+   "y": 216,
+   "r": 83
+  }
+ ]
+}

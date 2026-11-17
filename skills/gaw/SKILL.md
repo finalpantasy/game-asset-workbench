@@ -22,12 +22,16 @@ Run it as `gaw` if it is on PATH, otherwise `target/release/gaw.exe` inside the 
 | Read what the user marked in the window | `requests show latest --json` | `references/mark-and-fix.md` |
 | Check an edit left locked places alone | `requests locks latest cand.glb` | `references/mark-and-fix.md` |
 | Draw a candidate from saved close-up views | `views render` | `references/mark-and-fix.md` |
+| Turn "it looks messy" into places to fix (jagged edges, discoloration, seam stripes, direction breaks, dark gutters, smear, flat plastic, specks, stipple, hard layer cuts, fine wood-grain stripes) | `defects cand.glb --part NAME --ref stock.glb` | `references/defects.md` |
+| Pass or fail a candidate against stock on the defect numbers and the user's marked places (hair spec in `references/`) | `gate --spec GATE.json cand.glb` | `references/defects.md` (gate section) |
+| Look at the same close-up of every marked place for stock and each candidate, side by side | `closelook --marks M.json --reference stock.glb --candidates A.glb B.glb` | `references/defects.md` (close-look section) |
 | Lay out UVs so nothing shares a texel | `pattern` (built in), `relayout` (Blender) | `references/layout.md` |
 | Paint on rendered pictures, bake to the atlas | `bake` | `references/layout.md` |
 | Score a candidate against stock by eye-like difference | `judge` | `references/judge.md` |
 | Retexture or rebuild hair cards | `hair`, `judge --strands` | `references/hair-strap.md` |
 | Fix a belt strap or thin lines in paint | `strap-*`, `line-repaint`, `boundary-check`, `paint-fix`, `shells` | `references/hair-strap.md` |
 | Write textures the game loads fast | `ship` | `references/ship.md` |
+| Make an edited mesh load in the game as a custom model (FBX for Memoria) | `fbx cand.glb --out NEW --readback` | `references/fbx.md` |
 
 ## Core loops
 

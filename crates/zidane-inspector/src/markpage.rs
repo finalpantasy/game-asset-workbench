@@ -24,6 +24,8 @@ use wb_core::Texture;
 
 #[path = "markinspect.rs"]
 mod markinspect;
+#[path = "markhair.rs"]
+mod markhair;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tool {
@@ -41,9 +43,10 @@ pub enum Tool {
     Paint,
     Clone,
     Smudge,
+    Comb,
 }
 
-const TOOLS: [Tool; 14] = [Tool::Turn, Tool::Part, Tool::Brush, Tool::Lasso, Tool::Edge, Tool::Probe, Tool::Grab, Tool::Smooth, Tool::Inflate, Tool::Deflate, Tool::Flatten, Tool::Paint, Tool::Clone, Tool::Smudge];
+const TOOLS: [Tool; 15] = [Tool::Turn, Tool::Part, Tool::Brush, Tool::Lasso, Tool::Edge, Tool::Probe, Tool::Grab, Tool::Smooth, Tool::Inflate, Tool::Deflate, Tool::Flatten, Tool::Paint, Tool::Clone, Tool::Smudge, Tool::Comb];
 
 impl Tool {
     fn label(self) -> &'static str {
@@ -62,6 +65,7 @@ impl Tool {
             Tool::Paint => "Paint",
             Tool::Clone => "Clone",
             Tool::Smudge => "Smudge",
+            Tool::Comb => "Comb",
         }
     }
     fn tip(self) -> &'static str {
@@ -80,6 +84,7 @@ impl Tool {
             Tool::Paint => "Paint color on the model or the texture. On the model it reaches across texture seams.",
             Tool::Clone => "Alt+click where to copy from, then paint to copy that area here.",
             Tool::Smudge => "Drag to smear the colors under the brush.",
+            Tool::Comb => "Drag along the hair the way it should flow, root to tip. The strokes go into the request (strokes.json) for the hair tool. Ctrl+click a stroke removes it.",
         }
     }
     fn by_name(s: &str) -> Option<Tool> {
@@ -144,6 +149,7 @@ enum Drag {
     Lasso { before: SelState, erase: bool, place: Where, pts: Vec<Pos2> },
     Sculpt { kind: Sculpt, before: Vec<V3>, grab: Option<(Grab, f32, Pos2)>, last: Option<Pos2> },
     Paint { place: Where, image: usize, before: Vec<u8>, bbox: [usize; 4], stroke_w: HashMap<usize, f32>, last: Option<Pos2>, clone_off: Option<Vec2>, clean: Option<(usize, usize, Vec<u8>)> },
+    Comb { pts: Vec<markhair::CombPt>, last: Pos2 },
 }
 
 enum Work {
@@ -197,6 +203,7 @@ pub struct Mark {
     vb: ViewBuf,
     rect_v: Rect,
     look: markinspect::Look,
+    hair: markhair::HairTools,
     // texture view
     image: usize,
     tex_zoom: f32,
@@ -269,6 +276,7 @@ impl Mark {
             vb: ViewBuf { tex: None, w: 0, h: 0, pick: vec![], key: None },
             rect_v: Rect::NOTHING,
             look: markinspect::Look::default(),
+            hair: markhair::HairTools::default(),
             image: 0,
             tex_zoom: 1.0,
             tex_pan: Vec2::ZERO,
@@ -727,6 +735,8 @@ impl App {
         ui.add_space(8.0);
         m.look_card(ui, d, &mut self.cam);
         ui.add_space(8.0);
+        m.hair_card(ui, ctx, d, &mut self.cam);
+        ui.add_space(8.0);
         theme::card(ui, "Tell the AI", |ui| {
             ui.add(egui::TextEdit::multiline(&mut m.note).desired_rows(5).desired_width(f32::INFINITY).hint_text("What is wrong here, or what you want. For example: \"the strap should leave the belt along this edge, not float in front of it\"."));
             ui.add_space(4.0);
@@ -818,7 +828,7 @@ impl App {
 
 impl Mark {
     fn tool_column(&mut self, ui: &mut egui::Ui) {
-        let groups: [(&str, &[Tool]); 3] = [("MARK", &[Tool::Turn, Tool::Part, Tool::Brush, Tool::Lasso, Tool::Edge, Tool::Probe]), ("SHAPE", &[Tool::Grab, Tool::Smooth, Tool::Inflate, Tool::Deflate, Tool::Flatten]), ("PAINT", &[Tool::Paint, Tool::Clone, Tool::Smudge])];
+        let groups: [(&str, &[Tool]); 4] = [("MARK", &[Tool::Turn, Tool::Part, Tool::Brush, Tool::Lasso, Tool::Edge, Tool::Probe]), ("SHAPE", &[Tool::Grab, Tool::Smooth, Tool::Inflate, Tool::Deflate, Tool::Flatten]), ("PAINT", &[Tool::Paint, Tool::Clone, Tool::Smudge]), ("HAIR", &[Tool::Comb])];
         for (title, tools) in groups {
             ui.vertical_centered(|ui| ui.label(RichText::new(title).size(10.5).color(theme::FAINT).strong()));
             for &t in tools {
@@ -845,6 +855,9 @@ impl Mark {
 
     fn set_tool(&mut self, t: Tool) {
         self.drag = None;
+        if t == Tool::Comb && self.tool != Tool::Comb {
+            self.hair.show_cards = true;
+        }
         self.tool = t;
         self.vb.key = None;
     }
@@ -1154,6 +1167,7 @@ impl Mark {
                     self.tex_ver += 1;
                 }
             }
+            Some(Drag::Comb { .. }) => {}
             None => {}
         }
         self.say("Stroke cancelled".into(), true);
@@ -1192,6 +1206,7 @@ impl Mark {
                     self.say("Look through works on the model".into(), false);
                 }
             }
+            Tool::Comb => self.comb_press(place, p, mods, d, topo, cam),
             Tool::Brush => {
                 self.drag = Some(Drag::Select { before: self.sel_state(), erase: mods.ctrl, place, last: None });
                 self.stroke_to(p, d, topo, cam);
@@ -1265,6 +1280,7 @@ impl Mark {
     fn release(&mut self, d: &Doc, topo: &Topo) {
         let Some(drag) = self.drag.take() else { return };
         match drag {
+            Drag::Comb { pts, .. } => self.comb_release(pts),
             Drag::Select { before, .. } => {
                 self.push_undo(Snap { what: "mark".into(), sel: Some(before), gpos: None, tex: None });
                 self.say(format!("{} triangles marked", self.marked_count()), true);
@@ -1311,6 +1327,10 @@ impl Mark {
                         pts.push(p);
                     }
                 }
+                return;
+            }
+            Some(Drag::Comb { .. }) => {
+                self.comb_move(p, d, topo, cam);
                 return;
             }
             None => return,
@@ -1837,6 +1857,7 @@ impl Mark {
             }
         }
         self.draw_look(&painter, topo, cam);
+        self.draw_hair(&painter, d, topo, cam);
         let cap = format!("{} · {}{}", if self.posed_clip().is_some() { self.clip.clone().unwrap_or_default() } else { "Rest pose".into() }, if self.sym { "Mirror on" } else { "Mirror off" }, if !self.has_edits(topo) { "" } else if self.saved_ver == (self.pos_ver, self.tex_ver) { " · edited, saved" } else { " · edited (not saved)" });
         let g = painter.layout_no_wrap(cap, egui::FontId::proportional(12.5), theme::WEAK);
         let r = Rect::from_min_size(rect.left_bottom() + Vec2::new(10.0, -g.size().y - 16.0), g.size() + Vec2::new(14.0, 8.0));
@@ -2013,6 +2034,7 @@ impl Mark {
                 painter.circle_stroke(s, 7.0, Stroke::new(1.5, theme::TEAL));
             }
         }
+        self.draw_hair_tex(&painter, d);
         painter.rect_stroke(view, CornerRadius::same(10), Stroke::new(1.0, theme::LINE), egui::StrokeKind::Inside);
     }
 
@@ -2103,6 +2125,7 @@ impl Mark {
             symmetry: self.sym,
             after_glb: None,
             locked: self.look.locked.clone(),
+            attach: self.hair_attachments(d),
         })
     }
 
@@ -2387,7 +2410,7 @@ impl Mark {
                 );
             }
             other => {
-                if !self.look_script(other, &rest, cam, d, topo) {
+                if !self.look_script(other, &rest, cam, d, topo) && !self.hair_script(other, &rest, ctx, d, topo, cam) {
                     bad(&format!("unknown command {other}"));
                 }
             }
@@ -2473,6 +2496,15 @@ fn draw_icon(p: &Painter, r: Rect, t: Tool, c: Color32) {
             }
             p.circle_stroke(at(0.5, 0.5), w * 0.2, Stroke::new(1.6, theme::TEAL));
             p.line_segment([at(0.5, 0.05), at(0.5, 0.95)], Stroke::new(1.0, theme::TEAL));
+        }
+        Tool::Comb => {
+            // A comb: a spine with teeth, and a flow line under it.
+            p.line_segment([at(0.12, 0.3), at(0.88, 0.3)], Stroke::new(2.2, c));
+            for k in 0..6 {
+                let x = 0.18 + k as f32 * 0.13;
+                p.line_segment([at(x, 0.3), at(x, 0.62)], Stroke::new(1.4, c));
+            }
+            p.line_segment([at(0.1, 0.85), at(0.9, 0.78)], Stroke::new(1.4, theme::TEAL));
         }
         Tool::Grab => {
             p.line_segment([at(0.5, 0.05), at(0.5, 0.95)], s);

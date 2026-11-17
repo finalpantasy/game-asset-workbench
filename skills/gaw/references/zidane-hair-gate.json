@@ -1,0 +1,25 @@
+{
+ "name": "Zidane hair gate",
+ "about": "Run: gaw gate --spec skills/gaw/references/zidane-hair-gate.json --out-dir NEW_DIR CANDIDATE.glb (from the Modding folder). Stock passes against itself; every rule is relative to stock, so a version is judged against what the game already shows.",
+ "part": "hair",
+ "reference": "exports/Zidane-idle.glb",
+ "marks_file": "zidane-hair-marks.json",
+ "rules": [
+  {"id": "smear-blur load at most 1.0x stock", "type": "ratio", "kinds": ["smear-blur"], "measure": "load", "max_x": 1.0, "floor": 0.05,
+   "why": "strands blurred into a smear (marks 6, 9)"},
+  {"id": "flat-patch load at most 1.0x stock", "type": "ratio", "kinds": ["flat-patch"], "measure": "load", "max_x": 1.0, "floor": 0.05,
+   "why": "plastic wedges and one-tone cards (marks 1, 3)"},
+  {"id": "direction-break count at most 1.5x stock", "type": "ratio", "kinds": ["direction-break"], "measure": "count", "max_x": 1.5,
+   "why": "strands turning across a seam"},
+  {"id": "layer-direction-cut count at most 1.5x stock", "type": "ratio", "kinds": ["layer-direction-cut"], "measure": "count", "max_x": 1.5,
+   "why": "straight cuts across the strand flow where cards meet"},
+  {"id": "layer-direction-cut load at most 1.5x stock", "type": "ratio", "kinds": ["layer-direction-cut"], "measure": "load", "max_x": 1.5, "floor": 0.05,
+   "why": "same, as a share of the card edges"},
+  {"id": "lock-scale load at most 1.0x stock", "type": "ratio", "kinds": ["lock-scale"], "measure": "load", "max_x": 1.0, "floor": 0.05,
+   "why": "fine wood-grain stripes where stock has broad locks"},
+  {"id": "no new cut, smear or flat box at marks 1 6 7 8 9", "type": "marks", "kinds": ["direction-break", "layer-direction-cut", "smear-blur", "flat-patch"], "marks": [1, 6, 7, 8, 9], "allow": "reference",
+   "why": "the user's marks: a hit means more boxes of these kinds than stock has in the same circle"},
+  {"id": "no new speck box at marks 2 3 4 5 8", "type": "marks", "kinds": ["speck"], "marks": [2, 3, 4, 5, 8], "allow": "reference",
+   "why": "dots, dither and cut-off shards at the user's marks"}
+ ]
+}

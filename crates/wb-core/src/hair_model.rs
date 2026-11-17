@@ -39,6 +39,20 @@ pub struct ModelOpts {
     /// Close gaps between cards of different locks up to this many grid spacings (0 = off).
     pub gap: f64,
     pub backfaces: Backfaces,
+    /// Per selected triangle: keep it as stock geometry (still textured as hair). Used for
+    /// triangles grown into the hair part that stay welded to other parts (a hairline on the
+    /// face). Their edges shared with remeshed hair take the same points, so nothing cracks.
+    /// Empty = none.
+    pub keep: Vec<bool>,
+    /// Halvings of the triangles along the tip outline before the alpha cut (finer, smoother tips).
+    pub tip_refine: usize,
+    /// Blur of the stock alpha before the cut (stock texels; rounds the stair steps of a coarse
+    /// alpha into a smooth outline).
+    pub tip_blur: f64,
+    /// Keep cards of different locks at least this many grid spacings apart where they lie on
+    /// each other (0 = off). Each pair of locks keeps the stacking it has on average, so two
+    /// cards that cross back and forth stop trading depth (a stipple at close range).
+    pub layer_sep: f64,
 }
 
 pub struct HairTri {
@@ -73,6 +87,9 @@ pub struct Report {
     pub gap_vertices: usize,
     pub gap_max_move: f64,
     pub gap_hist: [usize; 6],
+    /// Vertices moved apart from another lock's card (`ModelOpts::layer_sep`), and the most any moved.
+    pub sep_vertices: usize,
+    pub sep_max_move: f64,
 }
 
 pub struct HairModel {
@@ -90,6 +107,8 @@ enum Key {
     Edge(usize, usize, usize, usize),
     Grid(usize, usize),
     Cut(usize, usize),
+    Cent(usize),
+    Mid(usize, usize),
 }
 
 struct Verts {
@@ -220,9 +239,12 @@ pub fn remesh(model: &Model, hs: &HairSet, fl: &Flow, pr: &Param, stock: &Sheet,
     let w_protect = |w: usize| -> bool { w_regions.get(&w).map(|r| r.len() > 1).unwrap_or(false) || uses.iter().any(|(e, u)| (e.0 == w || e.1 == w) && u.len() > 2) };
 
     let nreg = fl.region_lock.len();
+    let kept = |i: usize| o.keep.get(i).copied().unwrap_or(false);
     let mut reg_tris = vec![Vec::new(); nreg];
     for &i in &prim {
-        reg_tris[fl.region[i]].push(i);
+        if !kept(i) {
+            reg_tris[fl.region[i]].push(i);
+        }
     }
     let mut vs = Verts { pos: Vec::new(), src: Vec::new(), protect: Vec::new(), map: HashMap::new() };
     let mut out: Vec<HairTri> = Vec::new();
@@ -289,7 +311,7 @@ pub fn remesh(model: &Model, hs: &HairSet, fl: &Flow, pr: &Param, stock: &Sheet,
             let mut cdt: ConstrainedDelaunayTriangulation<Point2<f64>> = ConstrainedDelaunayTriangulation::new();
             let mut gid: Vec<usize> = Vec::new(); // per cdt vertex index: global vertex
             let mut s_at: Vec<[f64; 2]> = Vec::new();
-            let mut insert = |cdt: &mut ConstrainedDelaunayTriangulation<Point2<f64>>, s: [f64; 2], g: usize, gid: &mut Vec<usize>, s_at: &mut Vec<[f64; 2]>, merged: &mut usize| -> Option<spade::handles::FixedVertexHandle> {
+            let insert = |cdt: &mut ConstrainedDelaunayTriangulation<Point2<f64>>, s: [f64; 2], g: usize, gid: &mut Vec<usize>, s_at: &mut Vec<[f64; 2]>, merged: &mut usize| -> Option<spade::handles::FixedVertexHandle> {
                 let hdl = cdt.insert(Point2::new(s[0], s[1])).ok()?;
                 let ix = hdl.index();
                 if ix == gid.len() {
@@ -399,8 +421,132 @@ pub fn remesh(model: &Model, hs: &HairSet, fl: &Flow, pr: &Param, stock: &Sheet,
             }
         }
     }
+    // Kept triangles: stock corners plus the points remeshed neighbors put on shared edges.
+    for &i in &prim {
+        if !kept(i) {
+            continue;
+        }
+        let w = hs.wt[i];
+        let su = hair::tri_uv(model, hs, i);
+        let pu = pr.uv[i];
+        let mut poly: Vec<(usize, [f64; 3])> = Vec::new();
+        for c in 0..3 {
+            let d = (c + 1) % 3;
+            let g = vs.get(Key::Orig(w[c]), hs.wpos[w[c]], wv[&w[c]], true);
+            let mut bc = [0.0; 3];
+            bc[c] = 1.0;
+            poly.push((g, bc));
+            let (lo, hi) = (w[c].min(w[d]), w[c].max(w[d]));
+            let k = edge_k(lo, hi);
+            let mut pts: Vec<(f64, usize)> = (1..k).filter_map(|j| vs.map.get(&Key::Edge(lo, hi, j, k)).map(|&g| (j as f64 / k as f64, g))).collect();
+            if w[c] != lo {
+                pts.reverse();
+            }
+            for (t, g) in pts {
+                let t = if w[c] == lo { t } else { 1.0 - t };
+                let mut bc = [0.0; 3];
+                bc[c] = 1.0 - t;
+                bc[d] = t;
+                poly.push((g, bc));
+            }
+        }
+        let mk = |bc: [f64; 3], q: &[[f64; 2]; 3]| [bc[0] * q[0][0] + bc[1] * q[1][0] + bc[2] * q[2][0], bc[0] * q[0][1] + bc[1] * q[1][1] + bc[2] * q[2][1]];
+        let tris: Vec<[(usize, [f64; 3]); 3]> = if poly.len() == 3 {
+            vec![[poly[0], poly[1], poly[2]]]
+        } else {
+            let cb = [1.0 / 3.0; 3];
+            let cp = mul(add(add(hs.wpos[w[0]], hs.wpos[w[1]]), hs.wpos[w[2]]), 1.0 / 3.0);
+            let g = vs.get(Key::Cent(i), cp, wv[&w[0]], true);
+            (0..poly.len()).map(|k| [(g, cb), poly[k], poly[(k + 1) % poly.len()]]).collect()
+        };
+        for t in tris {
+            for q in &t {
+                vs.protect[q.0] = true;
+            }
+            out.push(HairTri { v: t.map(|q| q.0), suv: t.map(|q| mk(q.1, &su)), puv: t.map(|q| mk(q.1, &pu)), parent: i, region: fl.region[i], back: false });
+        }
+    }
     let tri_area = |vs: &Verts, t: &HairTri| 0.5 * len(cross(sub(vs.pos[t.v[1]], vs.pos[t.v[0]]), sub(vs.pos[t.v[2]], vs.pos[t.v[0]])));
     rep.area_before_trim = out.iter().map(|t| tri_area(&vs, t)).sum();
+
+    // Stock alpha for the cut, blurred so the outline follows the painted shape, not its texels.
+    let mut ablur: Vec<f32> = (0..stock.w * stock.h).map(|k| stock.rgba[k * 4 + 3] as f32 / 255.0).collect();
+    hair::blur(&mut ablur, stock.w, stock.h, 1, o.tip_blur);
+    let alpha_at = |u: f64, v: f64| -> f64 {
+        let x = u * stock.w as f64 - 0.5;
+        let y = v * stock.h as f64 - 0.5;
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0, y - y0);
+        let g = |xx: i64, yy: i64| ablur[(yy.clamp(0, stock.h as i64 - 1) as usize) * stock.w + xx.clamp(0, stock.w as i64 - 1) as usize] as f64;
+        let (x0, y0) = (x0 as i64, y0 as i64);
+        (g(x0, y0) * (1.0 - fx) + g(x0 + 1, y0) * fx) * (1.0 - fy) + (g(x0, y0 + 1) * (1.0 - fx) + g(x0 + 1, y0 + 1) * fx) * fy
+    };
+    // Refine along the outline: split triangles near the cut level. Conforming: a triangle with
+    // two split edges gets its third split too, so each ends with 0, 1 or 3.
+    if o.alpha_cut > 0.0 {
+        for _ in 0..o.tip_refine {
+            let mut marked: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+            for t in &out {
+                let a: Vec<f64> = (0..3).map(|c| if vs.protect[t.v[c]] { 1.0 } else { alpha_at(t.suv[c][0], t.suv[c][1]) }).collect();
+                let lo = a.iter().cloned().fold(f64::MAX, f64::min);
+                let hi = a.iter().cloned().fold(f64::MIN, f64::max);
+                if lo < o.alpha_cut + 0.2 && hi > o.alpha_cut - 0.2 {
+                    for c in 0..3 {
+                        marked.insert(ekey(t.v[c], t.v[(c + 1) % 3]));
+                    }
+                }
+            }
+            loop {
+                let mut more = Vec::new();
+                for t in &out {
+                    let m: Vec<(usize, usize)> = (0..3).map(|c| ekey(t.v[c], t.v[(c + 1) % 3])).collect();
+                    if m.iter().filter(|e| marked.contains(e)).count() == 2 {
+                        more.extend(m.into_iter().filter(|e| !marked.contains(e)));
+                    }
+                }
+                if more.is_empty() {
+                    break;
+                }
+                marked.extend(more);
+            }
+            if marked.is_empty() {
+                break;
+            }
+            let mut next = Vec::with_capacity(out.len() * 2);
+            for t in out {
+                let m: Vec<bool> = (0..3).map(|c| marked.contains(&ekey(t.v[c], t.v[(c + 1) % 3]))).collect();
+                let nm = m.iter().filter(|&&x| x).count();
+                if nm == 0 {
+                    next.push(t);
+                    continue;
+                }
+                let mid = |c: usize, vs: &mut Verts| -> (usize, [f64; 2], [f64; 2]) {
+                    let d = (c + 1) % 3;
+                    let (a, b) = (t.v[c].min(t.v[d]), t.v[c].max(t.v[d]));
+                    let p = lerp3(vs.pos[a], vs.pos[b], 0.5);
+                    let (src, prot) = (vs.src[a], vs.protect[a] && vs.protect[b]);
+                    let g = vs.get(Key::Mid(a, b), p, src, prot);
+                    (g, lerp2(t.suv[c], t.suv[d], 0.5), lerp2(t.puv[c], t.puv[d], 0.5))
+                };
+                let cor = |c: usize| (t.v[c], t.suv[c], t.puv[c]);
+                let mk = |a: (usize, [f64; 2], [f64; 2]), b: (usize, [f64; 2], [f64; 2]), c: (usize, [f64; 2], [f64; 2])| HairTri { v: [a.0, b.0, c.0], suv: [a.1, b.1, c.1], puv: [a.2, b.2, c.2], parent: t.parent, region: t.region, back: false };
+                if nm == 3 {
+                    let (m0, m1, m2) = (mid(0, &mut vs), mid(1, &mut vs), mid(2, &mut vs));
+                    next.push(mk(cor(0), m0, m2));
+                    next.push(mk(m0, cor(1), m1));
+                    next.push(mk(m2, m1, cor(2)));
+                    next.push(mk(m0, m1, m2));
+                } else {
+                    let c = m.iter().position(|&x| x).unwrap();
+                    let mc = mid(c, &mut vs);
+                    let (d, e) = ((c + 1) % 3, (c + 2) % 3);
+                    next.push(mk(cor(c), mc, cor(e)));
+                    next.push(mk(mc, cor(d), cor(e)));
+                }
+            }
+            out = next;
+        }
+    }
 
     // Trim to the stock alpha outline.
     if o.alpha_cut > 0.0 {
@@ -408,7 +554,7 @@ pub fn remesh(model: &Model, hs: &HairSet, fl: &Flow, pr: &Param, stock: &Sheet,
         for t in &out {
             for c in 0..3 {
                 if alpha[t.v[c]].is_nan() {
-                    alpha[t.v[c]] = if vs.protect[t.v[c]] { 1.0 } else { stock.bilinear(t.suv[c][0], t.suv[c][1])[3] / 255.0 };
+                    alpha[t.v[c]] = if vs.protect[t.v[c]] { 1.0 } else { alpha_at(t.suv[c][0], t.suv[c][1]) };
                 }
             }
         }
@@ -455,8 +601,13 @@ pub fn remesh(model: &Model, hs: &HairSet, fl: &Flow, pr: &Param, stock: &Sheet,
     out.retain(|t| tri_area(&vs, t) > 1e-10);
     rep.area_after_trim = out.iter().map(|t| tri_area(&vs, t)).sum();
 
-    // Close small gaps: free boundary vertices onto the nearest card of another lock.
+    // Close small gaps: free boundary vertices toward the nearest card of another lock, stopping
+    // a hair short of it (a vertex placed on the other card makes the two fight for depth, which
+    // reads as a stipple of mismatched paint). Tip outline vertices (from the alpha cut) stay put:
+    // a tip hanging over another lock keeps the stock gap.
     {
+        let cut_v: std::collections::HashSet<usize> = vs.map.iter().filter_map(|(k, &i)| matches!(k, Key::Cut(..)).then_some(i)).collect();
+        let keep_off = 0.05 * h;
         let mut e_n: HashMap<(usize, usize), usize> = HashMap::new();
         for t in &out {
             for c in 0..3 {
@@ -482,7 +633,7 @@ pub fn remesh(model: &Model, hs: &HairSet, fl: &Flow, pr: &Param, stock: &Sheet,
         let mut moves: Vec<(usize, V3)> = Vec::new();
         let edges = [0.0, 0.25, 0.5, 1.0, 2.0, 4.0];
         for g in 0..vs.pos.len() {
-            if !bnd[g] || vs.protect[g] || locks_of[g].is_empty() {
+            if !bnd[g] || vs.protect[g] || locks_of[g].is_empty() || cut_v.contains(&g) {
                 continue;
             }
             let p = vs.pos[g];
@@ -502,14 +653,82 @@ pub fn remesh(model: &Model, hs: &HairSet, fl: &Flow, pr: &Param, stock: &Sheet,
                 let bin = edges.iter().rposition(|&e| rel >= e).unwrap_or(0);
                 rep.gap_hist[bin] += 1;
             }
-            if best.0 > 1e-7 && best.0 <= o.gap * h {
-                moves.push((g, best.1));
+            if best.0 > keep_off && best.0 <= o.gap * h {
+                moves.push((g, add(best.1, mul(sub(p, best.1), keep_off / best.0))));
             }
         }
         for (g, q) in moves {
             rep.gap_max_move = rep.gap_max_move.max(len(sub(q, vs.pos[g])));
             vs.pos[g] = q;
             rep.gap_vertices += 1;
+        }
+    }
+
+    // Separate stacked cards: each vertex near another lock's card moves along that card's
+    // outward normal to `layer_sep` spacings on the side its lock keeps on average against that
+    // lock. All moves come from the positions before this pass.
+    if o.layer_sep > 0.0 {
+        let sep = o.layer_sep * h;
+        let n_used = out.iter().flat_map(|t| t.v).collect::<std::collections::HashSet<_>>();
+        let center = mul(n_used.iter().fold([0.0; 3], |a, &g| add(a, vs.pos[g])), 1.0 / n_used.len().max(1) as f64);
+        let mut lock_of_v: Vec<Option<usize>> = vec![None; vs.pos.len()];
+        let mut multi = vec![false; vs.pos.len()];
+        for t in &out {
+            let l = hs.lock[t.parent];
+            for &g in &t.v {
+                match lock_of_v[g] {
+                    None => lock_of_v[g] = Some(l),
+                    Some(m) if m != l => multi[g] = true,
+                    _ => {}
+                }
+            }
+        }
+        // Per vertex: (other lock, signed distance along the other card's outward normal, normal).
+        let mut near: Vec<Option<(usize, f64, V3)>> = vec![None; vs.pos.len()];
+        for &g in &n_used {
+            let Some(l) = lock_of_v[g] else { continue };
+            if multi[g] || vs.protect[g] {
+                continue;
+            }
+            let p = vs.pos[g];
+            let mut best = (4.0 * sep, None);
+            for t in &out {
+                let lt = hs.lock[t.parent];
+                if lt == l {
+                    continue;
+                }
+                let (a, b, c) = (vs.pos[t.v[0]], vs.pos[t.v[1]], vs.pos[t.v[2]]);
+                let q = closest_on_tri(p, a, b, c);
+                let d = len(sub(q, p));
+                if d < best.0 {
+                    let mut n = hair::unit(cross(sub(b, a), sub(c, a)));
+                    if dot(n, sub(q, center)) < 0.0 {
+                        n = mul(n, -1.0);
+                    }
+                    best = (d, Some((lt, dot(sub(p, q), n), n)));
+                }
+            }
+            near[g] = best.1;
+        }
+        let mut side: HashMap<(usize, usize), f64> = HashMap::new();
+        for g in 0..vs.pos.len() {
+            if let (Some(l), Some((m, sd, _))) = (lock_of_v[g], near[g]) {
+                *side.entry((l, m)).or_default() += sd;
+            }
+        }
+        let mut moves = Vec::new();
+        for g in 0..vs.pos.len() {
+            if let (Some(l), Some((m, sd, n))) = (lock_of_v[g], near[g]) {
+                let sigma = if side[&(l, m)] >= 0.0 { 1.0 } else { -1.0 };
+                if sigma * sd < sep {
+                    moves.push((g, add(vs.pos[g], mul(n, sigma * sep - sd))));
+                }
+            }
+        }
+        for (g, q) in moves {
+            rep.sep_max_move = rep.sep_max_move.max(len(sub(q, vs.pos[g])));
+            vs.pos[g] = q;
+            rep.sep_vertices += 1;
         }
     }
 

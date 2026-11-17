@@ -199,6 +199,41 @@ impl HairSet {
         Ok(HairSet { mesh, tris, wid, wpos, wt, primary, lock, nlocks: lock_of_root.len(), degenerate, dup_same, dup_flipped, nonmanifold_edges })
     }
 
+    /// Regroups locks so that triangles flagged in `apart` (per selected triangle) never join a
+    /// lock with unflagged ones: a hairline grown into the hair part stays its own lock and does
+    /// not merge the cards it touches (which would change their strand solve).
+    pub fn relock(&mut self, apart: &[bool]) {
+        let n = self.tris.len();
+        let mut uses: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+        for i in 0..n {
+            if self.is_primary(i) {
+                let t = self.wt[i];
+                for k in 0..3 {
+                    uses.entry(ekey(t[k], t[(k + 1) % 3])).or_default().push(i);
+                }
+            }
+        }
+        let mut par: Vec<usize> = (0..n).collect();
+        for u in uses.values() {
+            if u.len() == 2 && apart[u[0]] == apart[u[1]] {
+                let (a, b) = (find(&mut par, u[0]), find(&mut par, u[1]));
+                par[a] = b;
+            }
+        }
+        let mut lock_of_root: HashMap<usize, usize> = HashMap::new();
+        for i in 0..n {
+            if self.is_primary(i) {
+                let r = find(&mut par, i);
+                let k = lock_of_root.len();
+                self.lock[i] = *lock_of_root.entry(r).or_insert(k);
+            }
+        }
+        for i in 0..n {
+            self.lock[i] = self.lock[self.primary[i]];
+        }
+        self.nlocks = lock_of_root.len();
+    }
+
     pub fn is_primary(&self, i: usize) -> bool {
         self.primary[i] == i
     }
@@ -498,7 +533,9 @@ pub fn neighbors(hs: &HairSet) -> Vec<Vec<(usize, (usize, usize))>> {
     }
     let mut nb = vec![Vec::new(); hs.tris.len()];
     for (e, u) in &uses {
-        if u.len() == 2 {
+        // Same lock only: a no-op for locks built from welded edges, but it keeps a lock split off
+        // by `relock` (a grown hairline) from smoothing its flow into the cards it touches.
+        if u.len() == 2 && hs.lock[u[0]] == hs.lock[u[1]] {
             nb[u[0]].push((u[1], *e));
             nb[u[1]].push((u[0], *e));
         }
@@ -518,12 +555,67 @@ pub fn hinge(hs: &HairSet, j: usize, i: usize, e: (usize, usize), d: V3) -> V3 {
     unit(add(mul(ax, dot(d, ax)), mul(pi, dot(d, pj))))
 }
 
+/// One flow solve over the whole hair surface (all locks together), on top of `FlowOpts`.
+#[derive(Clone, Debug, Default)]
+pub struct GlobalFlow {
+    /// Weight of nearby triangles of OTHER locks (layered cards) in the smoothing; 0 = per lock.
+    pub couple: f64,
+    /// How far (model units) a triangle looks for other locks' triangles.
+    pub couple_radius: f64,
+    /// Guide strokes drawn on the surface, root to tip.
+    pub comb: Vec<CombStroke>,
+    /// Flip a whole lock when its flow runs away from where the stock alpha fades (its tips).
+    pub tip_flip: bool,
+    /// Paint weight where the stock paint runs within `paint_strong_deg` of the away-from-root
+    /// direction (0 = `FlowOpts::paint_weight` everywhere). There the paint is trusted more, so
+    /// strands follow the painted ones; where the two disagree more (whorls, crown sides) the
+    /// plain weight keeps the strand coordinates solvable. Cards seen edge-on from the root
+    /// (the away direction mostly out of plane) keep the plain weight too.
+    pub paint_strong: f64,
+    pub paint_strong_deg: f64,
+}
+
+/// A comb stroke: rest-pose points from root to tip, its weight (1 = override the stock paint) and
+/// its reach (model units).
+#[derive(Clone, Debug)]
+pub struct CombStroke {
+    pub points: Vec<V3>,
+    pub weight: f64,
+    pub radius: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FlowAgree {
+    /// Nearby triangle pairs from different locks with near-parallel planes.
+    pub pairs: usize,
+    /// Angle (degrees) between the two flows of those pairs, per lock solve and after the global solve.
+    pub median_before: f64,
+    pub p90_before: f64,
+    pub over45_before: usize,
+    pub median_after: f64,
+    pub p90_after: f64,
+    pub over45_after: usize,
+    /// Triangles a comb stroke reached.
+    pub combed: usize,
+    /// Locks whose flow runs away from their faded (tip) ends, and how many were flipped.
+    pub tip_against: Vec<usize>,
+    pub tip_flipped: usize,
+}
+
 pub fn flow(model: &Model, hs: &HairSet, stock: &Sheet, o: &FlowOpts) -> Flow {
+    flow_global(model, hs, stock, o, &GlobalFlow::default()).0
+}
+
+/// `flow`, solved over all locks at once: nearby layered cards pull toward each other (`couple`),
+/// comb strokes pin the direction where they lie, and each lock's direction is checked against
+/// where its stock alpha fades (the tips).
+pub fn flow_global(model: &Model, hs: &HairSet, stock: &Sheet, o: &FlowOpts, g: &GlobalFlow) -> (Flow, FlowAgree) {
     let n = hs.tris.len();
     let mut dir = vec![[0.0; 3]; n];
     let mut away = vec![[0.0; 3]; n];
     let mut coherence = vec![0.0; n];
     let mut ambiguous = vec![false; n];
+    let (strong, strong_cos) = (g.paint_strong, g.paint_strong_deg.to_radians().cos());
     for i in 0..n {
         if !hs.is_primary(i) {
             continue;
@@ -545,7 +637,11 @@ pub fn flow(model: &Model, hs: &HairSet, stock: &Sheet, o: &FlowOpts) -> Flow {
                     if dot(p, g_unit) < 0.0 {
                         p = mul(p, -1.0);
                     }
-                    let w = o.paint_weight * ((coh - 0.08) / 0.3).clamp(0.0, 1.0);
+                    // Only where the away direction lies well in the card (not edge-on near the root
+                    // line, where the crown sides turn and a strong paint seed makes flow breaks).
+                    let near = strong > 0.0 && dot(p, g_unit) >= strong_cos && gfrac >= 0.6;
+                    let pw = if near { strong.max(o.paint_weight) } else { o.paint_weight };
+                    let w = pw * ((coh - 0.08) / 0.3).clamp(0.0, 1.0);
                     let wg = (1.0 - w) * gfrac.max(0.05);
                     f = unit(add(mul(p, w), mul(g_unit, wg)));
                     amb = gfrac < 0.25 && dot(p, g_unit).abs() < 0.3;
@@ -560,29 +656,148 @@ pub fn flow(model: &Model, hs: &HairSet, stock: &Sheet, o: &FlowOpts) -> Flow {
         dir[i] = f;
         ambiguous[i] = amb;
     }
-    // Smooth across welded edges, never across a parting.
-    let nb = neighbors(hs);
-    let cos_part = o.part_angle.to_radians().cos();
-    for _ in 0..o.smooth_iters {
-        let prev = dir.clone();
-        for i in 0..n {
-            if !hs.is_primary(i) {
-                continue;
-            }
-            let nrm = hs.normal(i);
-            let mut acc = mul(prev[i], 2.0);
-            for &(j, e) in &nb[i] {
-                let q = hinge(hs, j, i, e, prev[j]);
-                if dot(q, prev[i]) > cos_part {
-                    acc = add(acc, q);
+    let dir_plain = dir.clone();
+    let prim: Vec<usize> = (0..n).filter(|&i| hs.is_primary(i)).collect();
+    // Comb pins: per triangle, the strokes' direction near its centroid.
+    let mut pin = vec![([0.0; 3], 0.0f64); n];
+    let mut combed = 0;
+    for &i in &prim {
+        let c = hs.centroid(i);
+        let (mut acc, mut ws) = ([0.0; 3], 0.0);
+        for st in &g.comb {
+            for w2 in st.points.windows(2) {
+                let seg = sub(w2[1], w2[0]);
+                let l2 = dot(seg, seg);
+                if l2 < 1e-18 || st.radius <= 0.0 {
+                    continue;
+                }
+                let t = (dot(sub(c, w2[0]), seg) / l2).clamp(0.0, 1.0);
+                let d = len(sub(c, add(w2[0], mul(seg, t))));
+                if d < st.radius {
+                    let w = st.weight * (1.0 - d / st.radius).powi(2);
+                    acc = add(acc, mul(unit(seg), w));
+                    ws += w;
                 }
             }
-            let a = unit(project_plane(acc, nrm));
-            if len(a) > 0.5 {
-                dir[i] = a;
+        }
+        let p = unit(project_plane(acc, hs.normal(i)));
+        if ws > 1e-6 && len(p) > 0.5 {
+            let k = ws.min(1.0);
+            pin[i] = (p, k);
+            combed += 1;
+            let d = unit(add(mul(dir[i], 1.0 - k), mul(p, k)));
+            dir[i] = if len(d) > 0.5 { d } else { p };
+        }
+    }
+    // Other locks nearby with near-parallel planes (layered cards): the coupling and the check.
+    let mut near: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+    if g.couple_radius > 0.0 {
+        let cen: Vec<V3> = (0..n).map(|i| hs.centroid(i)).collect();
+        for (a, &i) in prim.iter().enumerate() {
+            for &j in &prim[a + 1..] {
+                if hs.lock[i] == hs.lock[j] {
+                    continue;
+                }
+                let d = len(sub(cen[i], cen[j]));
+                if d < g.couple_radius && dot(hs.normal(i), hs.normal(j)).abs() > 0.7 {
+                    let w = 1.0 - d / g.couple_radius;
+                    near[i].push((j, w));
+                    near[j].push((i, w));
+                }
             }
         }
     }
+    // Smooth across welded edges, never across a parting; optionally toward layered cards of other
+    // locks and comb pins.
+    let nb = neighbors(hs);
+    let cos_part = o.part_angle.to_radians().cos();
+    let smooth_all = |start: &[V3], couple: f64, pins: bool| -> Vec<V3> {
+        let mut dir = start.to_vec();
+        for _ in 0..o.smooth_iters {
+            let prev = dir.clone();
+            for &i in &prim {
+                let nrm = hs.normal(i);
+                let mut acc = mul(prev[i], 2.0);
+                for &(j, e) in &nb[i] {
+                    let q = hinge(hs, j, i, e, prev[j]);
+                    if dot(q, prev[i]) > cos_part {
+                        acc = add(acc, q);
+                    }
+                }
+                if couple > 0.0 {
+                    for &(j, w) in &near[i] {
+                        let q = unit(project_plane(prev[j], nrm));
+                        if dot(q, prev[i]) > 0.0 {
+                            acc = add(acc, mul(q, couple * w));
+                        }
+                    }
+                }
+                if pins && pin[i].1 > 0.0 {
+                    acc = add(acc, mul(pin[i].0, 6.0 * pin[i].1));
+                }
+                let a = unit(project_plane(acc, nrm));
+                if len(a) > 0.5 {
+                    dir[i] = a;
+                }
+            }
+        }
+        dir
+    };
+    let agree = |d: &[V3]| -> (f64, f64, usize, usize) {
+        let mut v = Vec::new();
+        for &i in &prim {
+            for &(j, _) in &near[i] {
+                if j > i {
+                    let q = unit(project_plane(d[j], hs.normal(i)));
+                    if len(q) > 0.5 {
+                        v.push(dot(d[i], q).clamp(-1.0, 1.0).acos().to_degrees());
+                    }
+                }
+            }
+        }
+        v.sort_by(f64::total_cmp);
+        let at = |f: f64| v.get(((v.len().max(1) - 1) as f64 * f).round() as usize).copied().unwrap_or(0.0);
+        (at(0.5), at(0.9), v.iter().filter(|&&a| a > 45.0).count(), v.len())
+    };
+    let before = smooth_all(&dir_plain, 0.0, false);
+    let mut dir = if g.couple > 0.0 || combed > 0 { smooth_all(&dir, g.couple, true) } else { before.clone() };
+    let (mb, pb, ob, npairs) = agree(&before);
+    let (ma, pa, oa, _) = agree(&dir);
+    // Tip check: where the stock alpha fades along the flow, the flow should point that way.
+    let mut vote = vec![(0.0f64, 0.0f64); hs.nlocks];
+    for &i in &prim {
+        let uv = tri_uv(model, hs, i);
+        let cu = [(uv[0][0] + uv[1][0] + uv[2][0]) / 3.0, (uv[0][1] + uv[1][1] + uv[2][1]) / 3.0];
+        let a: [f64; 3] = std::array::from_fn(|k| {
+            let q = [uv[k][0] * 0.85 + cu[0] * 0.15, uv[k][1] * 0.85 + cu[1] * 0.15];
+            stock.px((q[0] * stock.w as f64).floor() as i64, (q[1] * stock.h as f64).floor() as i64)[3] / 255.0
+        });
+        let drop = a.iter().cloned().fold(f64::MIN, f64::max) - a.iter().cloned().fold(f64::MAX, f64::min);
+        if drop < 0.4 {
+            continue;
+        }
+        let (gr, _) = basis_grads(hs.corners(i));
+        let grad = (0..3).fold([0.0; 3], |s, k| add(s, mul(gr[k], a[k])));
+        let al = dot(dir[i], unit(mul(grad, -1.0)));
+        if al > 0.5 {
+            vote[hs.lock[i]].0 += drop;
+        } else if al < -0.5 {
+            vote[hs.lock[i]].1 += drop;
+        }
+    }
+    let tip_against: Vec<usize> = (0..hs.nlocks).filter(|&l| vote[l].1 > 2.0 * vote[l].0 && vote[l].1 > 1.0).collect();
+    let mut tip_flipped = 0;
+    if g.tip_flip {
+        for &l in &tip_against {
+            for &i in &prim {
+                if hs.lock[i] == l {
+                    dir[i] = mul(dir[i], -1.0);
+                }
+            }
+            tip_flipped += 1;
+        }
+    }
+    let agreement = FlowAgree { pairs: npairs, median_before: mb, p90_before: pb, over45_before: ob, median_after: ma, p90_after: pa, over45_after: oa, combed, tip_against, tip_flipped };
     // Regions: locks cut where neighbor flows disagree.
     let mut par: Vec<usize> = (0..n).collect();
     let mut partings = 0;
@@ -622,7 +837,7 @@ pub fn flow(model: &Model, hs: &HairSet, stock: &Sheet, o: &FlowOpts) -> Flow {
         coherence[i] = coherence[p];
         ambiguous[i] = ambiguous[p];
     }
-    Flow { dir, away, coherence, ambiguous, region, region_lock, partings }
+    (Flow { dir, away, coherence, ambiguous, region, region_lock, partings }, agreement)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -945,7 +1160,7 @@ pub fn param(hs: &HairSet, fl: &Flow, root: &Root) -> Param {
             let weak: Vec<V3> = target.iter().map(|&t| mul(t, ws)).collect();
             let u = solve_gradient_aniso(&pos, &tris, &weak, Some((&along, along_w())), &prior, &pull);
             // Keep u increasing across the flow the same way as the target.
-            let s: f64 = tl.iter().enumerate().map(|(k, &i)| {
+            let s: f64 = tl.iter().enumerate().map(|(k, &_i)| {
                 let (g, a) = basis_grads(tris[k].map(|v| pos[v]));
                 a * dot((0..3).fold([0.0; 3], |acc, c| add(acc, mul(g[c], u[tris[k][c]]))), target[k])
             }).sum();
@@ -1400,6 +1615,13 @@ impl Palette {
     /// True when a color does not belong to this hair: wrong hue, washed out to gray, near black,
     /// or the stock's transparent magenta.
     pub fn is_fringe(&self, rgb_: [f64; 3]) -> bool {
+        self.is_fringe_by(rgb_, 35.0, 0.3, 12.0)
+    }
+
+    /// `is_fringe` with its limits as arguments (hue tolerance in degrees, minimum chroma as a
+    /// fraction of the hair's, minimum L). The bake uses tighter limits than the test so that
+    /// mip averages of in-palette texels stay in the palette too.
+    pub fn is_fringe_by(&self, rgb_: [f64; 3], hue_tol: f64, chroma_frac: f64, min_l: f64) -> bool {
         let l = lab(rgb_);
         let c = (l[1] * l[1] + l[2] * l[2]).sqrt();
         let h = l[2].atan2(l[1]).to_degrees();
@@ -1408,7 +1630,7 @@ impl Palette {
             dh = 360.0 - dh;
         }
         let magenta = rgb_[0] > 100.0 && rgb_[2] > 90.0 && rgb_[0] > 1.35 * rgb_[1] && rgb_[2] > 1.25 * rgb_[1];
-        magenta || l[0] < 12.0 || (c > 8.0 && dh > 35.0) || c < 0.3 * self.chroma
+        magenta || l[0] < min_l || (c > 8.0 && dh > hue_tol) || c < chroma_frac * self.chroma
     }
 }
 
@@ -1495,7 +1717,7 @@ impl Default for Style {
     }
 }
 
-fn hash(a: u64) -> u64 {
+pub(crate) fn hash(a: u64) -> u64 {
     let mut x = a.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     x ^= x >> 30;
     x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -1503,18 +1725,18 @@ fn hash(a: u64) -> u64 {
     x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)
 }
-fn h01(a: u64) -> f64 {
+pub(crate) fn h01(a: u64) -> f64 {
     (hash(a) >> 11) as f64 / (1u64 << 53) as f64
 }
-fn h2(seed: u64, i: i64, j: i64) -> f64 {
+pub(crate) fn h2(seed: u64, i: i64, j: i64) -> f64 {
     h01(seed ^ (i as u64).wrapping_mul(0x51_7CC1_B727_220A) ^ (j as u64).wrapping_mul(0x2545_F491_4F6C_DD1D))
 }
-fn smooth(t: f64) -> f64 {
+pub(crate) fn smooth(t: f64) -> f64 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 /// 2D value noise in 0..1.
-fn vnoise(seed: u64, x: f64, y: f64) -> f64 {
+pub(crate) fn vnoise(seed: u64, x: f64, y: f64) -> f64 {
     let (xi, yi) = (x.floor() as i64, y.floor() as i64);
     let (fx, fy) = (smooth(x - xi as f64), smooth(y - yi as f64));
     let a = h2(seed, xi, yi);
@@ -1591,6 +1813,118 @@ fn strand_octave(ctx: &SynthCtx, region: usize, u: f64, v: f64, k: i64) -> ([f64
     (c, prof)
 }
 
+/// Crisp strand layer: one fiber per cell across the strands (jittered center, width and
+/// brightness, broken into segments along them), dark gaps between, a second finer layer on top.
+/// Widths are in texels so the strands stay a set size on the sheet; values are zero-mean so the
+/// low-pass form (lock shading) is kept at any mip.
+#[derive(Clone, Debug)]
+pub struct Fibers {
+    /// Lightness swing (Lab L) of the main layer.
+    pub gain: f64,
+    /// Cell width of the main and fine layers, in texels.
+    pub width: f64,
+    pub fine_width: f64,
+    /// Fine layer strength relative to the main one.
+    pub fine: f64,
+    pub seed: u64,
+    mean: f64,
+}
+
+impl Fibers {
+    pub fn new(gain: f64, width: f64, fine_width: f64, fine: f64, seed: u64) -> Fibers {
+        let mut f = Fibers { gain, width, fine_width, fine, seed, mean: 0.0 };
+        let (mut acc, n) = (0.0, 40000);
+        for i in 0..n {
+            let u = h01(seed ^ 0xabc ^ (i as u64).wrapping_mul(7919)) * 400.0;
+            let v = h01(seed ^ 0xdef ^ (i as u64).wrapping_mul(104729)) * 4000.0;
+            acc += f.raw(i % 7, u, v, 1.0);
+        }
+        f.mean = acc / n as f64;
+        f
+    }
+
+    fn raw(&self, lock: usize, u: f64, v: f64, scale: f64) -> f64 {
+        let sd = hash(self.seed ^ (lock as u64 + 1).wrapping_mul(0x2F1F_3A57));
+        let a = fiber_layer(sd, u, v, self.width / scale);
+        if self.fine > 0.0 {
+            a + self.fine * fiber_layer(sd ^ 0xF1, u, v, self.fine_width / scale)
+        } else {
+            a
+        }
+    }
+
+    /// Offset in L (zero-mean) at strand coordinates (u, v), `scale` texels per unit.
+    pub fn at(&self, lock: usize, u: f64, v: f64, scale: f64) -> f64 {
+        self.gain * (self.raw(lock, u, v, scale) - self.mean)
+    }
+}
+
+/// Edge ramp of a fiber, as a share of its half-width. A softer ramp (0.5) gave more one-pixel
+/// specks in `gaw defects`, not fewer, and weaker layer edges.
+pub(crate) const FIBER_EDGE: f64 = 0.25;
+
+fn fiber_layer(seed: u64, u: f64, v: f64, wu: f64) -> f64 {
+    let wob = 0.6 * (vnoise(seed ^ 5, u / (wu * 3.0), v / (wu * 25.0)) - 0.5);
+    let x = u / wu + wob;
+    let i = x.floor() as i64;
+    let mut val = -1.0f64;
+    // Nearest fiber edge on each side of x, with the fiber's level there, for gap closing.
+    let (mut left, mut right) = ((f64::NEG_INFINITY, -1.0f64), (f64::INFINITY, -1.0f64));
+    for j in i - 2..=i + 2 {
+        let c = j as f64 + 0.5 + 0.5 * (h2(seed, j, 1) - 0.5);
+        let hw = 0.30 + 0.25 * h2(seed, j, 2);
+        let sj = seed ^ (j as u64).wrapping_mul(0x9E37_79B9);
+        // Fibers thin out along their length but never vanish: several neighbors gone at once
+        // left wide one-tone dark bands (flat patches).
+        let pres = 0.35 + 0.65 * smooth((vnoise(sj ^ 9, v / (wu * 30.0), 0.5) - 0.25) / 0.2);
+        let bright = 0.3 + 0.7 * h2(seed, j, 3);
+        let at = |d: f64| -1.0 + smooth((1.0 - d) / FIBER_EDGE) * pres * (1.0 + 1.2 * bright * (1.0 - d * d).max(0.0).sqrt());
+        let d = (x - c).abs() / hw;
+        if d < 1.0 {
+            val = val.max(at(d));
+        }
+        // Edge level just inside the fiber (d = 0.75), the brightness a closed gap takes.
+        if c + hw <= x && c + hw > left.0 {
+            left = (c + hw, at(0.75));
+        }
+        if c - hw >= x && c - hw < right.0 {
+            right = (c - hw, at(0.75));
+        }
+    }
+    // A dark gap narrower than 0.4 of a cell renders as a one-pixel line at the close-up mips
+    // (a dot to the eye and to `gaw defects`): fill it between the two fiber edges.
+    let gap = right.0 - left.0;
+    if gap < 0.4 && gap > 0.0 {
+        let t = (x - left.0) / gap;
+        val = val.max(left.1 + (right.1 - left.1) * t);
+    }
+    val
+}
+
+/// Lightness with a soft knee (12 L wide) under the brightest in-gamut L at this a, b.
+fn soft_top(c: [f64; 3]) -> f64 {
+    let inside = |l: f64| rgb([l, c[1], c[2]]).iter().all(|&x| x <= 255.0);
+    let knee = 12.0;
+    if c[0] < 50.0 || !inside(0.0) {
+        return c[0];
+    }
+    let (mut lo, mut hi) = (0.0f64, 100.0f64);
+    for _ in 0..14 {
+        let m = 0.5 * (lo + hi);
+        if inside(m) {
+            lo = m;
+        } else {
+            hi = m;
+        }
+    }
+    let k0 = lo - knee;
+    if c[0] > k0 {
+        k0 + knee * ((c[0] - k0) / knee).tanh()
+    } else {
+        c[0]
+    }
+}
+
 fn to_rgb8(c: [f64; 3]) -> [u8; 3] {
     let r = rgb(c);
     [r[0].round().clamp(0.0, 255.0) as u8, r[1].round().clamp(0.0, 255.0) as u8, r[2].round().clamp(0.0, 255.0) as u8]
@@ -1613,6 +1947,97 @@ pub fn bary2(p: [[f64; 2]; 3], c: [f64; 2]) -> Option<[f64; 3]> {
     Some([l0, l1, 1.0 - l0 - l1])
 }
 
+/// Squared-distance transform along one line (Felzenszwalb and Huttenlocher).
+fn dt1d(f: &[f64], d: &mut [f64], v: &mut [usize], z: &mut [f64]) {
+    let n = f.len();
+    let mut k = 0usize;
+    v[0] = 0;
+    z[0] = f64::NEG_INFINITY;
+    z[1] = f64::INFINITY;
+    for q in 1..n {
+        loop {
+            let p = v[k];
+            let sx = ((f[q] + (q * q) as f64) - (f[p] + (p * p) as f64)) / (2.0 * q as f64 - 2.0 * p as f64);
+            if sx <= z[k] && k > 0 {
+                k -= 1;
+                continue;
+            }
+            if sx <= z[k] {
+                // k == 0: replace the first parabola
+                v[0] = q;
+                z[0] = f64::NEG_INFINITY;
+                z[1] = f64::INFINITY;
+                break;
+            }
+            k += 1;
+            v[k] = q;
+            z[k] = sx;
+            z[k + 1] = f64::INFINITY;
+            break;
+        }
+    }
+    k = 0;
+    for q in 0..n {
+        while z[k + 1] < q as f64 {
+            k += 1;
+        }
+        let p = v[k];
+        d[q] = (q as f64 - p as f64).powi(2) + f[p];
+    }
+}
+
+/// Euclidean distance (texels) from every cell to the nearest cell where `target` is true
+/// (a large value when there is none).
+pub fn edt_to(target: &[bool], w: usize, h: usize) -> Vec<f64> {
+    const INF: f64 = 1e12;
+    let mut g: Vec<f64> = target.iter().map(|&t| if t { 0.0 } else { INF }).collect();
+    let n = w.max(h);
+    let (mut f, mut d, mut v, mut z) = (vec![0.0; n], vec![0.0; n], vec![0usize; n], vec![0.0; n + 1]);
+    for x in 0..w {
+        for y in 0..h {
+            f[y] = g[y * w + x];
+        }
+        dt1d(&f[..h], &mut d[..h], &mut v[..h], &mut z[..h + 1]);
+        for y in 0..h {
+            g[y * w + x] = d[y];
+        }
+    }
+    for y in 0..h {
+        f[..w].copy_from_slice(&g[y * w..y * w + w]);
+        dt1d(&f[..w], &mut d[..w], &mut v[..w], &mut z[..w + 1]);
+        for x in 0..w {
+            g[y * w + x] = d[x].sqrt();
+        }
+    }
+    g
+}
+
+/// Cutout cleanup on a grid: pieces smaller than `min_area` cells or thinner than `min_width`
+/// (twice their deepest inside distance) go; enclosed holes smaller than `min_area` are filled.
+pub fn clean_mask(m: &mut [bool], w: usize, h: usize, min_area: usize, min_width: f64) {
+    let din = edt_to(&m.iter().map(|&x| !x).collect::<Vec<_>>(), w, h);
+    let mm: Vec<bool> = m.to_vec();
+    let (lab, sz, _, _) = crate::hairlook::components(w, h, &|i| mm[i], &|_, _| true);
+    let mut deep = vec![0.0f64; sz.len()];
+    for k in 0..w * h {
+        if lab[k] != usize::MAX {
+            deep[lab[k]] = deep[lab[k]].max(din[k]);
+        }
+    }
+    for k in 0..w * h {
+        if lab[k] != usize::MAX && (sz[lab[k]] < min_area || 2.0 * deep[lab[k]] < min_width) {
+            m[k] = false;
+        }
+    }
+    let mm: Vec<bool> = m.to_vec();
+    let (lab, sz, bd, _) = crate::hairlook::components(w, h, &|i| !mm[i], &|_, _| true);
+    for k in 0..w * h {
+        if lab[k] != usize::MAX && !bd[lab[k]] && sz[lab[k]] < min_area {
+            m[k] = true;
+        }
+    }
+}
+
 pub struct BakeIn<'a> {
     pub model: &'a Model,
     pub hs: &'a HairSet,
@@ -1628,6 +2053,24 @@ pub struct BakeIn<'a> {
     /// Ambient occlusion per weld id (1 = open).
     pub ao: Vec<f64>,
     pub ctx: SynthCtx<'a>,
+    /// Form layers (guide low-pass, node AO, highlight); `None` = synthesizer only.
+    pub look: Option<&'a Look>,
+    /// Alpha ramp half-width in texels around the cutout contour (0.6 = a hard edge).
+    pub sdf_spread: f64,
+    /// Per selected triangle: grown into the part (no guide paint; full style instead).
+    pub grown: Vec<bool>,
+    /// Dark line (Lab L) at the root of grown triangles, where they tuck under the hair.
+    pub root_line: f64,
+    /// Grown triangles (a widow's peak) sit in the bangs' shadow: darken them by this (Lab L),
+    /// half at their lowest point and all of it at their top, and cut a dark crevice of
+    /// `crevice` (Lab L) down their middle (the mean x of the grown corners).
+    pub grown_shade: f64,
+    pub crevice: f64,
+    /// Cutout cleanup in texels: drop pieces smaller than `alpha_min_area` or thinner than
+    /// `alpha_min_width`, fill enclosed holes smaller than `alpha_min_area`. 0 = the plain
+    /// gradient distance (v3).
+    pub alpha_min_area: usize,
+    pub alpha_min_width: f64,
 }
 
 /// Chart texels written by `bake`: per sheet texel, the chart (usize::MAX = none) and the selected
@@ -1635,13 +2078,65 @@ pub struct BakeIn<'a> {
 pub struct BakeMap {
     pub chart: Vec<usize>,
     pub inside: Vec<bool>,
+    /// Per stock-sheet texel: (sum of output L, count) over the inside texels whose stock UV falls
+    /// in it, for the form check (output low-pass against stock).
+    pub form: Vec<(f64, u32)>,
+    /// Gutter texels in all, and how many of them took the surface across a welded edge.
+    pub gutter: usize,
+    pub gutter_surface: usize,
 }
 
 /// Paints every chart into `rgba` (size x size). Returns which texels belong to which chart.
 pub fn bake(b: &BakeIn, rgba: &mut [u8]) -> BakeMap {
     let size = b.size;
-    let mut map = BakeMap { chart: vec![usize::MAX; size * size], inside: vec![false; size * size] };
+    let mut map = BakeMap { chart: vec![usize::MAX; size * size], inside: vec![false; size * size], form: vec![(0.0, 0); b.stock.w * b.stock.h], gutter: 0, gutter_surface: 0 };
+    let dctx = b.look.map(|lk| SynthCtx { style: &lk.detail, pal: b.ctx.pal, size: b.ctx.size, vmax: b.ctx.vmax });
+    // Extent of the grown triangles: (center x, half width, lowest y, highest y).
+    let gb = {
+        let pts: Vec<V3> = (0..b.hs.tris.len()).filter(|&i| b.grown.get(i).copied().unwrap_or(false)).flat_map(|i| b.hs.corners(i)).collect();
+        let cx = pts.iter().map(|p| p[0]).sum::<f64>() / pts.len().max(1) as f64;
+        let half = pts.iter().map(|p| (p[0] - cx).abs()).fold(0.0, f64::max);
+        let y0 = pts.iter().map(|p| p[1]).fold(f64::MAX, f64::min);
+        let y1 = pts.iter().map(|p| p[1]).fold(f64::MIN, f64::max);
+        (cx, half, y0, y1)
+    };
+    // Strand tangent per (weld id, region), area-weighted, for a smooth highlight.
+    let mut tan: HashMap<(usize, usize), V3> = HashMap::new();
+    if b.look.is_some_and(|lk| lk.light.is_some()) {
+        for i in 0..b.hs.tris.len() {
+            if !b.hs.is_primary(i) {
+                continue;
+            }
+            if let Some(d) = uv_dir_to_3d(b.hs.corners(i), b.pr.uv[i], [0.0, 1.0]) {
+                let d = mul(unit(d), b.hs.area(i));
+                for &w in &b.hs.wt[i] {
+                    let e = tan.entry((w, b.fl.region[i])).or_insert([0.0; 3]);
+                    *e = add(*e, d);
+                }
+            }
+        }
+    }
+    // Smooth normals per welded corner (oriented per lock), so the highlight does not facet.
+    let osign = orient(b.hs);
+    let mut wn: HashMap<(usize, usize), V3> = HashMap::new();
+    for i in 0..b.hs.tris.len() {
+        if !b.hs.is_primary(i) {
+            continue;
+        }
+        let n = mul(b.hs.normal(i), osign[i] * b.hs.area(i));
+        for &w in &b.hs.wt[i] {
+            let e = wn.entry((w, b.hs.lock[i])).or_insert([0.0; 3]);
+            *e = add(*e, n);
+        }
+    }
+    // Hair center, to orient normals outward for the highlight.
+    let hc = {
+        let ps: Vec<usize> = (0..b.hs.tris.len()).filter(|&i| b.hs.is_primary(i)).collect();
+        mul(ps.iter().fold([0.0; 3], |a, &i| add(a, b.hs.centroid(i))), 1.0 / ps.len().max(1) as f64)
+    };
     let stock_uv = |i: usize| tri_uv(b.model, b.hs, b.hs.primary[i]);
+    let nb = neighbors(b.hs);
+    let mut gutter_surface = 0usize;
     let sa = |u: f64, v: f64| {
         let x = u * b.stock.w as f64 - 0.5;
         let y = v * b.stock.h as f64 - 0.5;
@@ -1681,6 +2176,91 @@ pub fn bake(b: &BakeIn, rgba: &mut [u8]) -> BakeMap {
                 }
             }
         }
+        // Surface-space gutters: a gutter texel past a welded edge is the surface on the other side,
+        // so it takes the neighbor triangle (up to two rings away, same lock) whose strand
+        // coordinates contain it. Both sides of a seam then sample the same surface points, and
+        // bilinear filtering across the seam mixes like values.
+        for y in 0..h {
+            for x in 0..w {
+                let k = y * w + x;
+                if dist[k] == 0.0 || dist[k] == f64::MAX {
+                    continue;
+                }
+                let Some(t) = &cell[k] else { continue };
+                let q = [c.lo[0] + (x as f64 + 0.5 - b.pad as f64) / b.scale, c.lo[1] + (y as f64 + 0.5 - b.pad as f64) / b.scale];
+                let mut ring: Vec<usize> = vec![t.tri];
+                let mut seen: Vec<usize> = vec![t.tri];
+                let mut found = None;
+                'rings: for _ in 0..2 {
+                    let mut next = Vec::new();
+                    for &a in &ring {
+                        for &(n2, _) in &nb[a] {
+                            if seen.contains(&n2) {
+                                continue;
+                            }
+                            seen.push(n2);
+                            next.push(n2);
+                            if let Some(bc) = bary2(b.pr.uv[n2], q) {
+                                if bc.iter().all(|&l| l >= -1e-6) {
+                                    found = Some((n2, bc));
+                                    break 'rings;
+                                }
+                            }
+                        }
+                    }
+                    ring = next;
+                }
+                if found.is_none() {
+                    // The strand coordinates jump at this seam: unfold the neighbor across the
+                    // edge the texel lies past into this triangle's strand frame, keeping its 3D
+                    // shape, and read the texel's barycentrics there.
+                    let a = t.tri;
+                    let bt = t.bary;
+                    let k0 = (0..3).min_by(|&i, &j| bt[i].total_cmp(&bt[j])).unwrap_or(0);
+                    if bt[k0] < 0.0 {
+                        let (k1, k2) = ((k0 + 1) % 3, (k0 + 2) % 3);
+                        let (e1, e2) = (b.hs.wt[a][k1], b.hs.wt[a][k2]);
+                        if let Some(&(n2, _)) = nb[a].iter().find(|(_, e)| *e == ekey(e1, e2)) {
+                            let wn = b.hs.wt[n2];
+                            let m1 = wn.iter().position(|&x| x == e1);
+                            let m2 = wn.iter().position(|&x| x == e2);
+                            if let (Some(m1), Some(m2)) = (m1, m2) {
+                                let m3 = 3 - m1 - m2;
+                                let (pa, pb, pc) = (b.hs.wpos[e1], b.hs.wpos[e2], b.hs.wpos[wn[m3]]);
+                                let ab = sub(pb, pa);
+                                let l2 = dot(ab, ab).max(1e-18);
+                                let along = dot(sub(pc, pa), ab) / l2;
+                                let hgt = len(sub(sub(pc, pa), mul(ab, along)));
+                                let (ua, ub, uo) = (b.pr.uv[a][k1], b.pr.uv[a][k2], b.pr.uv[a][k0]);
+                                let d2 = [ub[0] - ua[0], ub[1] - ua[1]];
+                                let l2d = (d2[0] * d2[0] + d2[1] * d2[1]).sqrt();
+                                if l2d > 1e-12 {
+                                    let sc = l2d / l2.sqrt();
+                                    let mut pp = [-d2[1] / l2d, d2[0] / l2d];
+                                    if pp[0] * (uo[0] - ua[0]) + pp[1] * (uo[1] - ua[1]) > 0.0 {
+                                        pp = [-pp[0], -pp[1]];
+                                    }
+                                    let uc = [ua[0] + d2[0] * along + pp[0] * hgt * sc, ua[1] + d2[1] * along + pp[1] * hgt * sc];
+                                    if let Some(bc) = bary2([ua, ub, uc], q) {
+                                        if bc.iter().all(|&l| l >= -0.5) {
+                                            let mut bn = [0.0; 3];
+                                            bn[m1] = bc[0];
+                                            bn[m2] = bc[1];
+                                            bn[m3] = bc[2];
+                                            found = Some((n2, bn));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((n2, bc)) = found {
+                    cell[k] = Some(TexelIn { tri: n2, bary: bc });
+                    gutter_surface += 1;
+                }
+            }
+        }
         // Pass 1: stock alpha per texel (for the cutout distance field).
         let mut a_s = vec![1.0; w * h];
         for k in 0..w * h {
@@ -1693,6 +2273,51 @@ pub fn bake(b: &BakeIn, rgba: &mut [u8]) -> BakeMap {
                 a_s[k] = sa(u, v);
             }
         }
+        // Pass 1b: the cutout as a clean shape: threshold, drop specks and slivers, fill small
+        // holes, then an exact signed distance (texels, + inside), lightly smoothed.
+        let clean = b.alpha_min_area > 0;
+        let sdist: Vec<f64> = if clean {
+            let mut m: Vec<bool> = a_s.iter().map(|&a| a >= 0.5).collect();
+            clean_mask(&mut m, w, h, b.alpha_min_area, b.alpha_min_width);
+            let din = edt_to(&m.iter().map(|&x| !x).collect::<Vec<_>>(), w, h);
+            let dout = edt_to(&m, w, h);
+            let raw: Vec<f64> = (0..w * h).map(|k| if m[k] { din[k] - 0.5 } else { 0.5 - dout[k] }).collect();
+            let mut sm = raw.clone();
+            for y in 0..h {
+                for x in 0..w {
+                    let (mut acc, mut n) = (0.0, 0.0);
+                    for dy in -1i64..=1 {
+                        for dx in -1i64..=1 {
+                            let (xx, yy) = (x as i64 + dx, y as i64 + dy);
+                            if xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h {
+                                let wt = if dx == 0 && dy == 0 { 4.0 } else if dx == 0 || dy == 0 { 2.0 } else { 1.0 };
+                                acc += wt * raw[yy as usize * w + xx as usize];
+                                n += wt;
+                            }
+                        }
+                    }
+                    sm[y * w + x] = acc / n;
+                }
+            }
+            sm
+        } else {
+            Vec::new()
+        };
+        let mut alpha_k = vec![f64::NAN; w * h];
+        let mut si_k = vec![usize::MAX; w * h];
+        // Surface strands per texel, computed on all cores (the trace lookups are the slow part).
+        let f3: Vec<f64> = match b.look.and_then(|lk| lk.fibers3.as_ref()) {
+            None => Vec::new(),
+            Some(f) => {
+                let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8);
+                let chunk = (w * h).div_ceil(threads).max(1);
+                let parts: Vec<Vec<f64>> = std::thread::scope(|sc| {
+                    let hands: Vec<_> = cell.chunks(chunk).map(|part| sc.spawn(move || part.iter().map(|c| c.as_ref().map_or(0.0, |t| f.raw(b.hs, t.tri, t.bary))).collect::<Vec<f64>>())).collect();
+                    hands.into_iter().map(|hd| hd.join().unwrap()).collect()
+                });
+                parts.concat()
+            }
+        };
         // Pass 2: color and alpha.
         let e = b.ctx.size;
         for y in 0..h {
@@ -1708,19 +2333,66 @@ pub fn bake(b: &BakeIn, rgba: &mut [u8]) -> BakeMap {
                 let v = c.lo[1] + (y as f64 + 0.5 - b.pad as f64) / b.scale;
                 let dens: f64 = (0..3).map(|q| t.bary[q] * b.pr.dens[t.tri][q]).sum();
                 let (mut col, prof) = strand(&b.ctx, c.lock, u, v, dens);
+                let grown = b.grown.get(t.tri).copied().unwrap_or(false);
+                if grown {
+                    // No guide paint here: the full style (bundles, clump grooves) and a dark line
+                    // where the grown part tucks under the hair at its root. With surface strands
+                    // the chart style is left out (it restarts on each grown triangle and showed
+                    // their outlines): a plain palette tone, and the strands come from the surface.
+                    if let Some(lk) = b.look.filter(|lk| lk.fibers3.is_some()) {
+                        // The guide low-pass, which with surface strands covers the grown part
+                        // too (its own paint, averaged with the cards it meets).
+                        col = b.ctx.pal.at((v / b.ctx.vmax).clamp(0.0, 1.0));
+                        if let Some((g, low)) = &lk.color {
+                            if let Some(w) = g.weights(t.tri, t.bary) {
+                                col = std::array::from_fn(|q| w.iter().map(|&(ni, wt)| wt * low[ni][q]).sum());
+                            }
+                        }
+                    }
+                    col[0] -= b.root_line * (1.0 - smooth(v / (0.04 * e)));
+                    let pc = b.hs.corners(t.tri);
+                    let p: V3 = std::array::from_fn(|q| (0..3).map(|k| t.bary[k] * pc[k][q]).sum());
+                    let ty = ((p[1] - gb.2) / (gb.3 - gb.2).max(1e-9)).clamp(0.0, 1.0);
+                    col[0] -= b.grown_shade * (0.5 + 0.5 * ty);
+                    col[0] -= b.crevice * (1.0 - smooth((p[0] - gb.0).abs() / (0.15 * gb.1).max(1e-9)));
+                } else if let (Some(lk), Some(dctx)) = (b.look, &dctx) {
+                    if let Some((g, low)) = &lk.color {
+                        if let Some(w) = g.weights(t.tri, t.bary) {
+                            let lowc: [f64; 3] = std::array::from_fn(|q| w.iter().map(|&(ni, wt)| wt * low[ni][q]).sum());
+                            let (dc, _) = strand(dctx, c.lock, u, v, dens);
+                            let base = b.ctx.pal.at((v / b.ctx.vmax).clamp(0.0, 1.0));
+                            col = [lowc[0] + dc[0] - base[0], lowc[1], lowc[2]];
+                        }
+                    }
+                }
+                if let Some(f) = b.look.and_then(|lk| lk.fibers3.as_ref()) {
+                    col[0] += f.gain * (f3[k] - f.mean) * (col[0] / 60.0).clamp(0.4, 1.3);
+                } else if let Some(fb) = b.look.and_then(|lk| lk.fibers.as_ref()) {
+                    col[0] += fb.at(c.lock, u, v, b.scale) * (col[0] / 60.0).clamp(0.4, 1.3);
+                }
                 // Cutout distance (model units, + inside) from the stock alpha, then notches at tips.
                 let at = |xx: usize, yy: usize| a_s[yy.min(h - 1) * w + xx.min(w - 1)];
                 let gxa = 0.5 * (at(x + 1, y) - at(x.saturating_sub(1), y)) * b.scale;
                 let gya = 0.5 * (at(x, y + 1) - at(x, y.saturating_sub(1))) * b.scale;
                 let gl = (gxa * gxa + gya * gya).sqrt();
                 let a0 = a_s[k];
-                let d_s = if gl > 1e-9 { (a0 - 0.5) / gl } else if a0 >= 0.5 { 1e9 } else { -1e9 };
+                let d_s = if clean {
+                    sdist[k] / b.scale
+                } else if gl > 1e-9 {
+                    (a0 - 0.5) / gl
+                } else if a0 >= 0.5 {
+                    1e9
+                } else {
+                    -1e9
+                };
                 let d_s = d_s.clamp(-1.0 * e, 1.0 * e);
                 // Tip edges are where the alpha falls toward +v (the tip end).
                 let tipward = if gl > 1e-9 { (-gya / gl).clamp(0.0, 1.0) } else { 0.0 };
                 let depth = b.ctx.style.tip_depth * e * tipward;
                 let d = d_s - depth * prof;
-                let alpha = (0.5 + d * b.scale / 1.2).clamp(0.0, 1.0);
+                // Signed-distance alpha: 0.5 on the contour, ramping over `sdf_spread` texels to each
+                // side, so the game's 0.5 cutout follows a smooth line under magnification and mips.
+                let alpha = (0.5 + d * b.scale / (2.0 * b.sdf_spread.max(0.1))).clamp(0.0, 1.0);
                 // Tip lightening near tip edges.
                 if tipward > 0.0 && d_s < b.ctx.style.tip_len * e {
                     col[0] += b.ctx.style.tip_light * tipward * (1.0 - smooth(d_s / (b.ctx.style.tip_len * e)));
@@ -1728,27 +2400,99 @@ pub fn bake(b: &BakeIn, rgba: &mut [u8]) -> BakeMap {
                 // Ambient occlusion from the welded corners.
                 let wt = b.hs.wt[t.tri];
                 let bc = t.bary.map(|q| q.clamp(-0.5, 1.5));
-                let ao = (bc[0] * b.ao[wt[0]] + bc[1] * b.ao[wt[1]] + bc[2] * b.ao[wt[2]]).clamp(0.0, 1.0);
+                let mut ao = (bc[0] * b.ao[wt[0]] + bc[1] * b.ao[wt[1]] + bc[2] * b.ao[wt[2]]).clamp(0.0, 1.0);
+                if let Some((g, nodes)) = b.look.and_then(|lk| lk.ao.as_ref()) {
+                    if let Some(w) = g.weights(t.tri, t.bary) {
+                        ao = w.iter().map(|&(ni, wt)| wt * nodes[ni]).sum::<f64>().clamp(0.0, 1.0);
+                    }
+                }
                 col[0] *= 1.0 - b.ctx.style.ao * (1.0 - ao);
+                // Strand highlight, dimmed where occluded.
+                if let Some(li) = b.look.and_then(|lk| lk.light.as_ref()) {
+                    let r = b.fl.region[t.tri];
+                    let tg = (0..3).fold([0.0; 3], |a, q| add(a, mul(tan.get(&(wt[q], r)).copied().unwrap_or([0.0; 3]), bc[q].max(0.0))));
+                    if len(tg) > 1e-12 {
+                        let pi = b.hs.primary[t.tri];
+                        let n = {
+                            let lk = b.hs.lock[pi];
+                            let s = (0..3).fold([0.0; 3], |a, q| add(a, mul(wn.get(&(wt[q], lk)).copied().unwrap_or([0.0; 3]), bc[q].max(0.0))));
+                            let fnrm = mul(b.hs.normal(pi), osign[pi]);
+                            if len(s) > 1e-12 && dot(unit(s), fnrm) > 0.2 { unit(s) } else { fnrm }
+                        };
+                        let sw = b.ctx.style.strand * e;
+                        let jit = match b.look.and_then(|lk| lk.fibers3.as_ref()) {
+                            Some(f) => (0.3 * (f3[k] - f.mean)).clamp(-0.75, 0.75),
+                            None => vnoise(b.ctx.style.seed ^ 0x51ab, u / (2.0 * sw), v / (0.15 * e)) + 0.5 * vnoise(b.ctx.style.seed ^ 0x77, u / (7.0 * sw), v / (0.4 * e)) - 0.75,
+                        };
+                        let tg = unit(add(unit(tg), mul(n, li.shift * jit * 2.0)));
+                        let nout = if dot(n, sub(b.hs.centroid(t.tri), hc)) < 0.0 { mul(n, -1.0) } else { n };
+                        let to_l = unit(li.to_light);
+                        let vw = if len(li.to_view) < 1e-9 { nout } else { unit(li.to_view) };
+                        let hv = unit(add(to_l, vw));
+                        let th = dot(tg, hv);
+                        let spec = (1.0 - th * th).max(0.0).sqrt().powf(li.power);
+                        let lit = ((dot(nout, to_l) + 0.3) / 1.3).clamp(0.0, 1.0);
+                        let k = spec * (0.35 + 0.65 * ao) * lit;
+                        col[0] += li.gain * k;
+                        col[1] *= 1.0 - 0.25 * k;
+                        col[2] *= 1.0 - 0.25 * k;
+                    }
+                }
                 // Stay inside the hair's own colors: dark grooves keep hue and some chroma
                 // (out-of-gamut darks clip to grey or green otherwise). Pulls toward the palette.
                 col[0] = col[0].max(18.0);
+                // Bright strands near the top of the sRGB gamut: compress lightness with a soft knee
+                // below the brightest in-gamut L for this hue and chroma, so highlights keep their
+                // strand variation instead of all clipping to one cream tone (a flat patch).
+                col[0] = soft_top(col);
                 let base = b.ctx.pal.at((v / b.ctx.vmax).clamp(0.0, 1.0));
-                for _ in 0..12 {
+                for _ in 0..30 {
                     let r = rgb(col);
-                    if r.iter().all(|&c| (0.0..=255.0).contains(&c)) && !b.ctx.pal.is_fringe(r) {
+                    let r8 = to_rgb8(col).map(|x| x as f64);
+                    if r.iter().all(|&c| (0.0..=255.0).contains(&c)) && !b.ctx.pal.is_fringe_by(r, 28.0, 0.36, 14.0) && !b.ctx.pal.is_fringe_by(r8, 28.0, 0.36, 14.0) {
                         break;
                     }
                     col = [col[0] * 0.85 + base[0] * 0.15, col[1] * 0.8 + base[1] * 0.2, col[2] * 0.8 + base[2] * 0.2];
                 }
                 let px = to_rgb8(col);
+                if dist[k] == 0.0 {
+                    let su = stock_uv(t.tri);
+                    let bs = t.bary;
+                    let (fu, fv) = ((0..3).map(|q| bs[q] * su[q][0]).sum::<f64>(), (0..3).map(|q| bs[q] * su[q][1]).sum::<f64>());
+                    let (fx, fy) = ((fu * b.stock.w as f64).floor(), (fv * b.stock.h as f64).floor());
+                    if fx >= 0.0 && fy >= 0.0 && (fx as usize) < b.stock.w && (fy as usize) < b.stock.h {
+                        let f = &mut map.form[fy as usize * b.stock.w + fx as usize];
+                        f.0 += lab([px[0] as f64, px[1] as f64, px[2] as f64])[0];
+                        f.1 += 1;
+                    }
+                }
                 rgba[si * 4..si * 4 + 3].copy_from_slice(&px);
                 rgba[si * 4 + 3] = (alpha * 255.0).round() as u8;
+                alpha_k[k] = alpha;
+                si_k[k] = si;
                 map.chart[si] = ci;
                 map.inside[si] = dist[k] == 0.0;
+                if dist[k] > 0.0 {
+                    map.gutter += 1;
+                }
+            }
+        }
+        // After the tip notches: drop new specks and slivers, fill new holes.
+        if clean {
+            // Only the chart's inside counts (gutter and other charts' texels are off), the same as
+            // the islands check sees it: a sliver joined to its lock only through the gutter goes.
+            let mut m: Vec<bool> = (0..w * h).map(|k| !alpha_k[k].is_nan() && dist[k] <= 0.0 && alpha_k[k] >= 0.5).collect();
+            let before = m.clone();
+            clean_mask(&mut m, w, h, b.alpha_min_area, b.alpha_min_width);
+            for k in 0..w * h {
+                if m[k] != before[k] && si_k[k] != usize::MAX {
+                    let a = if m[k] { 0.6 } else { 0.3 };
+                    rgba[si_k[k] * 4 + 3] = (a * 255.0f64).round() as u8;
+                }
             }
         }
     }
+    map.gutter_surface = gutter_surface;
     map
 }
 
@@ -1912,6 +2656,440 @@ pub fn push_pull(rgba: &mut [u8], size: usize, valid: &[bool], fill: &[bool]) {
                 rgba[i * 4 + 3] = 0;
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 5b: form layers. The low frequencies (lock layout, crevices, root shade, hue) come from a
+// guide painted in the stock UV layout (the stock sheet by default), smoothed on the surface; the
+// synthesizer adds only fine strands. Ambient occlusion and a strand highlight are baked per
+// surface point, because the game's hair shader is unlit.
+// ---------------------------------------------------------------------------------------------
+
+/// The palette grade applied to one Lab color (hue rotation in degrees, chroma scale, L shift).
+pub fn grade_lab(c: [f64; 3], hue_shift: f64, chroma_scale: f64, l_shift: f64) -> [f64; 3] {
+    let (co, s) = (hue_shift.to_radians().cos(), hue_shift.to_radians().sin());
+    [(c[0] + l_shift).clamp(0.0, 100.0), chroma_scale * (c[1] * co - c[2] * s), chroma_scale * (c[1] * s + c[2] * co)]
+}
+
+/// Sample nodes on every selected triangle: a barycentric grid with about `spacing` between nodes
+/// (corner nodes are shared by position only, not by index).
+pub struct TriGrid {
+    pub n: Vec<usize>,
+    pub start: Vec<usize>,
+    pub len: usize,
+}
+
+impl TriGrid {
+    pub fn new(hs: &HairSet, spacing: f64, on: impl Fn(usize) -> bool) -> TriGrid {
+        let mut n = vec![0; hs.tris.len()];
+        let mut start = vec![0; hs.tris.len()];
+        let mut total = 0;
+        for i in 0..hs.tris.len() {
+            start[i] = total;
+            if !on(i) {
+                continue;
+            }
+            let c = hs.corners(i);
+            let e = (0..3).map(|k| len(sub(c[k], c[(k + 1) % 3]))).fold(0.0, f64::max);
+            let k = ((e / spacing.max(1e-9)).ceil() as usize).clamp(1, 96);
+            n[i] = k;
+            total += (k + 1) * (k + 2) / 2;
+        }
+        TriGrid { n, start, len: total }
+    }
+    fn idx(&self, t: usize, i: usize, j: usize) -> usize {
+        let n = self.n[t];
+        self.start[t] + j * (n + 1) - j * j.saturating_sub(1) / 2 + i
+    }
+    /// Nodes of triangle `t`: (node index, barycentric coordinates).
+    pub fn nodes(&self, t: usize) -> Vec<(usize, [f64; 3])> {
+        let n = self.n[t];
+        if n == 0 {
+            return Vec::new();
+        }
+        let nf = n as f64;
+        let mut v = Vec::with_capacity((n + 1) * (n + 2) / 2);
+        for j in 0..=n {
+            for i in 0..=(n - j) {
+                v.push((self.idx(t, i, j), [1.0 - (i + j) as f64 / nf, i as f64 / nf, j as f64 / nf]));
+            }
+        }
+        v
+    }
+    /// Linear interpolation weights at barycentric `bc` (gutter texels outside the triangle clamp
+    /// to its nearest cell). `None` when the triangle has no nodes.
+    pub fn weights(&self, t: usize, bc: [f64; 3]) -> Option<[(usize, f64); 3]> {
+        let n = self.n[t];
+        if n == 0 {
+            return None;
+        }
+        let nf = n as f64;
+        let fi = (bc[1] * nf).clamp(0.0, nf);
+        let fj = (bc[2] * nf).clamp(0.0, nf);
+        let mut i0 = (fi.floor() as usize).min(n - 1);
+        let mut j0 = (fj.floor() as usize).min(n - 1);
+        while i0 + j0 > n - 1 {
+            if i0 > j0 {
+                i0 -= 1;
+            } else {
+                j0 -= 1;
+            }
+        }
+        let (fx, fy) = (fi - i0 as f64, fj - j0 as f64);
+        Some(if fx + fy <= 1.0 {
+            [(self.idx(t, i0, j0), 1.0 - fx - fy), (self.idx(t, i0 + 1, j0), fx), (self.idx(t, i0, j0 + 1), fy)]
+        } else if i0 + j0 + 2 <= n {
+            [(self.idx(t, i0 + 1, j0 + 1), fx + fy - 1.0), (self.idx(t, i0, j0 + 1), 1.0 - fx), (self.idx(t, i0 + 1, j0), 1.0 - fy)]
+        } else {
+            let s = (fx + fy).max(1e-9);
+            [(self.idx(t, i0, j0), 0.0), (self.idx(t, i0 + 1, j0), fx / s), (self.idx(t, i0, j0 + 1), fy / s)]
+        })
+    }
+    pub fn pos(hs: &HairSet, t: usize, bc: [f64; 3]) -> V3 {
+        let c = hs.corners(t);
+        add(add(mul(c[0], bc[0]), mul(c[1], bc[1])), mul(c[2], bc[2]))
+    }
+}
+
+fn cell_of(p: V3, cs: f64) -> (i64, i64, i64) {
+    ((p[0] / cs).floor() as i64, (p[1] / cs).floor() as i64, (p[2] / cs).floor() as i64)
+}
+
+/// Separable Gaussian blur of `ch` channels (row-major w x h), sigma in pixels.
+pub fn blur(data: &mut [f32], w: usize, h: usize, ch: usize, sigma: f64) {
+    if sigma <= 0.05 {
+        return;
+    }
+    let r = (3.0 * sigma).ceil() as i64;
+    let k: Vec<f32> = (-r..=r).map(|x| (-(x * x) as f64 / (2.0 * sigma * sigma)).exp() as f32).collect();
+    let mut tmp = vec![0f32; data.len()];
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..ch {
+                let mut a = 0f32;
+                for (o, kv) in (-r..=r).zip(&k) {
+                    let xx = x as i64 + o;
+                    if xx >= 0 && xx < w as i64 {
+                        a += kv * data[(y * w + xx as usize) * ch + c];
+                    }
+                }
+                tmp[(y * w + x) * ch + c] = a;
+            }
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..ch {
+                let mut a = 0f32;
+                for (o, kv) in (-r..=r).zip(&k) {
+                    let yy = y as i64 + o;
+                    if yy >= 0 && yy < h as i64 {
+                        a += kv * tmp[(yy as usize * w + x) * ch + c];
+                    }
+                }
+                data[(y * w + x) * ch + c] = a;
+            }
+        }
+    }
+}
+
+/// Low-pass Lab of a guide image (painted in the stock UV layout) on the hair surface, per node of
+/// `grid`. The guide is blurred in its own space over hair texels only (`sigma_tex`, guide pixels;
+/// gutters and other parts never bleed in), sampled densely on the surface, then averaged in 3D
+/// within `radius` over samples of the same lock facing the same way. The 3D average is
+/// continuous across the stock UV seams, so the new charts meet without the stock's seam jumps.
+/// `use_tri`: triangles whose guide paint counts (false for triangles grown into the hair part).
+/// Nodes with no guide nearby are `None`.
+pub fn guide_lowpass(model: &Model, hs: &HairSet, guide: &Sheet, use_tri: &[bool], sigma_tex: f64, radius: f64, grid: &TriGrid) -> Vec<Option<[f64; 3]>> {
+    guide_lowpass_grouped(model, hs, guide, use_tri, &hs.lock, sigma_tex, radius, grid)
+}
+
+/// Locks joined across every welded edge: a lock grown into the part (its own lock, see `relock`)
+/// joins the cards it touches. `guide_lowpass_grouped` averages within these groups, so the guide
+/// runs on across the hairline instead of stepping where the grown triangles meet the cards.
+pub fn guide_groups(hs: &HairSet) -> Vec<usize> {
+    let n = hs.lock.iter().copied().max().map_or(0, |m| m + 1);
+    let mut par: Vec<usize> = (0..n).collect();
+    fn find(p: &mut [usize], mut x: usize) -> usize {
+        while p[x] != x {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        x
+    }
+    let mut first: HashMap<(usize, usize), usize> = HashMap::new();
+    for i in 0..hs.tris.len() {
+        if !hs.is_primary(i) {
+            continue;
+        }
+        let w = hs.wt[i];
+        for k in 0..3 {
+            let e = (w[k].min(w[(k + 1) % 3]), w[k].max(w[(k + 1) % 3]));
+            let l = hs.lock[i];
+            let o = *first.entry(e).or_insert(l);
+            let (a, b) = (find(&mut par, o), find(&mut par, l));
+            if a != b {
+                par[a] = b;
+            }
+        }
+    }
+    hs.lock.iter().map(|&l| find(&mut par, l)).collect()
+}
+
+/// `guide_lowpass` averaging over samples of the same `group` (per triangle) instead of the same lock.
+#[allow(clippy::too_many_arguments)]
+pub fn guide_lowpass_grouped(model: &Model, hs: &HairSet, guide: &Sheet, use_tri: &[bool], group: &[usize], sigma_tex: f64, radius: f64, grid: &TriGrid) -> Vec<Option<[f64; 3]>> {
+    let (gw, gh) = (guide.w, guide.h);
+    let sign = orient(hs);
+    // Hair texels of the guide.
+    let mut mask = vec![false; gw * gh];
+    for i in 0..hs.tris.len() {
+        if !hs.is_primary(i) || !use_tri[i] {
+            continue;
+        }
+        let p = tri_uv(model, hs, i).map(|q| [q[0] * gw as f64, q[1] * gh as f64]);
+        crate::uv::raster(p, gw, gh, 0.0, |x, y| mask[y * gw + x] = true);
+    }
+    let mut acc = vec![0f32; gw * gh * 4];
+    for y in 0..gh {
+        for x in 0..gw {
+            let px = guide.px(x as i64, y as i64);
+            if !mask[y * gw + x] || px[3] < 128.0 {
+                continue;
+            }
+            let l = lab([px[0], px[1], px[2]]);
+            let k = (y * gw + x) * 4;
+            acc[k] = l[0] as f32;
+            acc[k + 1] = l[1] as f32;
+            acc[k + 2] = l[2] as f32;
+            acc[k + 3] = 1.0;
+        }
+    }
+    blur(&mut acc, gw, gh, 4, sigma_tex);
+    let sample = |u: f64, v: f64| -> Option<([f64; 3], f64)> {
+        let x = u * gw as f64 - 0.5;
+        let y = v * gh as f64 - 0.5;
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0, y - y0);
+        let mut s = [0f64; 4];
+        for (dx, dy, w) in [(0, 0, (1.0 - fx) * (1.0 - fy)), (1, 0, fx * (1.0 - fy)), (0, 1, (1.0 - fx) * fy), (1, 1, fx * fy)] {
+            let xx = (x0 as i64 + dx).clamp(0, gw as i64 - 1) as usize;
+            let yy = (y0 as i64 + dy).clamp(0, gh as i64 - 1) as usize;
+            for c in 0..4 {
+                s[c] += w * acc[(yy * gw + xx) * 4 + c] as f64;
+            }
+        }
+        (s[3] > 0.05).then(|| ([s[0] / s[3], s[1] / s[3], s[2] / s[3]], s[3]))
+    };
+    // Dense samples on the surface.
+    let cloud_grid = TriGrid::new(hs, radius / 3.0, |i| hs.is_primary(i) && use_tri[i]);
+    let mut cloud: Vec<(V3, usize, V3, [f64; 3], f64)> = Vec::new();
+    for i in 0..hs.tris.len() {
+        let su = tri_uv(model, hs, i);
+        let n = mul(hs.normal(i), sign[i]);
+        for (_, bc) in cloud_grid.nodes(i) {
+            let (u, v) = ((0..3).map(|k| bc[k] * su[k][0]).sum::<f64>(), (0..3).map(|k| bc[k] * su[k][1]).sum::<f64>());
+            if let Some((l, w)) = sample(u, v) {
+                cloud.push((TriGrid::pos(hs, i, bc), group[i], n, l, w));
+            }
+        }
+    }
+    let mut cells: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    for (k, c) in cloud.iter().enumerate() {
+        cells.entry(cell_of(c.0, radius)).or_default().push(k);
+    }
+    // Per node: 3D Gaussian average.
+    let mut jobs: Vec<(usize, usize, [f64; 3])> = Vec::new();
+    for i in 0..hs.tris.len() {
+        for (ni, bc) in grid.nodes(i) {
+            jobs.push((ni, i, bc));
+        }
+    }
+    let mut out: Vec<Option<[f64; 3]>> = vec![None; grid.len];
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8);
+    let chunk = jobs.len().div_ceil(threads).max(1);
+    let res: Vec<Vec<(usize, Option<[f64; 3]>)>> = std::thread::scope(|sc| {
+        let hs_ = &hs;
+        let (cloud, cells, sign) = (&cloud, &cells, &sign);
+        let hands: Vec<_> = jobs
+            .chunks(chunk)
+            .map(|part| {
+                sc.spawn(move || {
+                    let s2 = (0.5 * radius) * (0.5 * radius);
+                    part.iter()
+                        .map(|&(ni, i, bc)| {
+                            let p = TriGrid::pos(hs_, i, bc);
+                            let n = mul(hs_.normal(i), sign[i]);
+                            let (cx, cy, cz) = cell_of(p, radius);
+                            let mut acc = [0f64; 4];
+                            for dx in -1..=1 {
+                                for dy in -1..=1 {
+                                    for dz in -1..=1 {
+                                        let Some(list) = cells.get(&(cx + dx, cy + dy, cz + dz)) else { continue };
+                                        for &k in list {
+                                            let c = &cloud[k];
+                                            if c.1 != group[i] || dot(c.2, n) < 0.3 {
+                                                continue;
+                                            }
+                                            let d = sub(c.0, p);
+                                            let d2 = dot(d, d);
+                                            if d2 > radius * radius {
+                                                continue;
+                                            }
+                                            let w = (-d2 / (2.0 * s2)).exp() * c.4;
+                                            for q in 0..3 {
+                                                acc[q] += w * c.3[q];
+                                            }
+                                            acc[3] += w;
+                                        }
+                                    }
+                                }
+                            }
+                            (ni, (acc[3] > 1e-6).then(|| [acc[0] / acc[3], acc[1] / acc[3], acc[2] / acc[3]]))
+                        })
+                        .collect()
+                })
+            })
+            .collect();
+        hands.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for part in res {
+        for (ni, v) in part {
+            out[ni] = v;
+        }
+    }
+    out
+}
+
+/// Ambient occlusion at every node of `grid`, both sides of the card (the more open side counts,
+/// as in `ambient_occlusion`), against `occluders` within `reach`. A uniform cell grid keeps each
+/// ray to the triangles along it.
+pub fn surface_ao(hs: &HairSet, grid: &TriGrid, occluders: &[[V3; 3]], rays: usize, reach: f64) -> Vec<f64> {
+    let cs = reach / 3.0;
+    let mut cells: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
+    for (k, t) in occluders.iter().enumerate() {
+        let lo = cell_of([t[0][0].min(t[1][0]).min(t[2][0]), t[0][1].min(t[1][1]).min(t[2][1]), t[0][2].min(t[1][2]).min(t[2][2])], cs);
+        let hi = cell_of([t[0][0].max(t[1][0]).max(t[2][0]), t[0][1].max(t[1][1]).max(t[2][1]), t[0][2].max(t[1][2]).max(t[2][2])], cs);
+        for x in lo.0..=hi.0 {
+            for y in lo.1..=hi.1 {
+                for z in lo.2..=hi.2 {
+                    cells.entry((x, y, z)).or_default().push(k as u32);
+                }
+            }
+        }
+    }
+    let mut jobs: Vec<(usize, usize, [f64; 3])> = Vec::new();
+    for i in 0..hs.tris.len() {
+        for (ni, bc) in grid.nodes(i) {
+            jobs.push((ni, i, bc));
+        }
+    }
+    let mut out = vec![1.0; grid.len];
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8);
+    let chunk = jobs.len().div_ceil(threads).max(1);
+    let res: Vec<Vec<(usize, f64)>> = std::thread::scope(|sc| {
+        let cells = &cells;
+        let hands: Vec<_> = jobs
+            .chunks(chunk)
+            .map(|part| {
+                sc.spawn(move || {
+                    let mut stamp = vec![0u32; occluders.len()];
+                    let mut ray_id = 0u32;
+                    part.iter()
+                        .map(|&(ni, i, bc)| {
+                            let p = TriGrid::pos(hs, i, bc);
+                            let n = hs.normal(i);
+                            let t1 = unit(if n[0].abs() < 0.9 { cross(n, [1.0, 0.0, 0.0]) } else { cross(n, [0.0, 1.0, 0.0]) });
+                            let t2 = cross(n, t1);
+                            let mut best = 0.0f64;
+                            for side in [1.0, -1.0] {
+                                let mut open = 0usize;
+                                for r in 0..rays {
+                                    let a = (r as f64 + 0.5) / rays as f64;
+                                    let phi = r as f64 * 2.399_963;
+                                    let (st, ct) = (a.sqrt(), (1.0 - a).sqrt());
+                                    let d = add(add(mul(t1, st * phi.cos()), mul(t2, st * phi.sin())), mul(n, ct * side));
+                                    let o = add(p, mul(n, 1e-4 * reach * side));
+                                    ray_id = ray_id.wrapping_add(1);
+                                    let mut hit = false;
+                                    let steps = 10;
+                                    'march: for s in 0..=steps {
+                                        let q = add(o, mul(d, reach * s as f64 / steps as f64));
+                                        let Some(list) = cells.get(&cell_of(q, cs)) else { continue };
+                                        for &k in list {
+                                            if stamp[k as usize] == ray_id {
+                                                continue;
+                                            }
+                                            stamp[k as usize] = ray_id;
+                                            let t = &occluders[k as usize];
+                                            let f = |v: V3| [v[0] as f32, v[1] as f32, v[2] as f32];
+                                            if crate::geom::ray_tri(f(o), f(d), f(t[0]), f(t[1]), f(t[2]), (2e-3 * reach) as f32).is_some_and(|tt| (tt as f64) < reach) {
+                                                hit = true;
+                                                break 'march;
+                                            }
+                                        }
+                                    }
+                                    if !hit {
+                                        open += 1;
+                                    }
+                                }
+                                best = best.max(open as f64 / rays as f64);
+                            }
+                            (ni, best)
+                        })
+                        .collect()
+                })
+            })
+            .collect();
+        hands.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for part in res {
+        for (ni, v) in part {
+            out[ni] = v;
+        }
+    }
+    out
+}
+
+/// Baked strand highlight (Kajiya-Kay): bright where the strand direction is perpendicular to the
+/// half vector of a fixed light and a fixed viewer. Strands are shifted along the normal by noise,
+/// so the band breaks into strands instead of a flat stripe.
+#[derive(Clone, Debug)]
+pub struct Light {
+    /// Direction to the light and to the viewer (model space). A zero `to_view` views each
+    /// surface along its outward normal, so the band sits on every side's own crown (a baked
+    /// highlight is seen from all sides); the band fades on the side facing away from the light.
+    pub to_light: V3,
+    pub to_view: V3,
+    /// Sharpness (exponent) and strength (Lab L at the peak).
+    pub power: f64,
+    pub gain: f64,
+    /// Per-strand tangent shift along the normal (0..1).
+    pub shift: f64,
+}
+
+/// Form layers for `bake`.
+pub struct Look {
+    /// Low-pass Lab per node (already graded), from `guide_lowpass`; the synthesizer then adds
+    /// only the strands of `detail`.
+    pub color: Option<(TriGrid, Vec<[f64; 3]>)>,
+    pub detail: Style,
+    /// Ambient occlusion per node (1 = open); replaces the per-vertex occlusion.
+    pub ao: Option<(TriGrid, Vec<f64>)>,
+    pub light: Option<Light>,
+    /// Crisp strand layer on top of everything (see `Fibers`).
+    pub fibers: Option<Fibers>,
+    /// Strands traced on the 3D surface (`hairfiber`); used instead of `fibers` when set, and it
+    /// also drives the highlight's strand jitter, so neither restarts at chart seams.
+    pub fibers3: Option<crate::hairfiber::Fibers3>,
+}
+
+impl Look {
+    /// The detail style: fine strands and a little clump variation, no shading terms (those come
+    /// from the guide). `strands` and `clumps` scale the style's own strand and clump contrast.
+    pub fn detail_style(s: &Style, strands: f64, clumps: f64) -> Style {
+        Style { strand_contrast: s.strand_contrast * strands, clump_contrast: s.clump_contrast * clumps, bundle: 0.0, clump_edge_dark: 0.0, root_dark: 0.0, band_gain: 0.0, tip_light: 0.0, ..s.clone() }
     }
 }
 
@@ -2090,9 +3268,177 @@ pub fn fringe(tex: &crate::Texture, hair: &[bool], pal: &Palette, levels: usize)
             shown += 1;
             if pal.is_fringe([px[i * 4] as f64, px[i * 4 + 1] as f64, px[i * 4 + 2] as f64]) {
                 count += 1;
+                // GAW_FRINGE_AT=1 prints where the first few fringe texels are (for debugging).
+                if count <= 8 && std::env::var_os("GAW_FRINGE_AT").is_some() {
+                    eprintln!("fringe texel: level {l} at ({}, {}) rgba {:?} hair fraction {:.2}", i % w, i / w, &px[i * 4..i * 4 + 4], frac[i]);
+                }
             }
         }
         out.push((l, count, shown));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------------------------
+// Seam stitch (safety net) and alpha coverage per mip
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default)]
+pub struct SeamReport {
+    /// Points sampled on chart seams inside one flow region (strands should continue).
+    pub points: usize,
+    /// Lab difference between the two sides' bilinear samples at the same seam point.
+    pub mean_before: f64,
+    pub max_before: f64,
+    pub over_before: usize,
+    pub mean_after: f64,
+    pub max_after: f64,
+    pub over_after: usize,
+    /// Gutter texels the stitch changed, and the mean change (RGB, 0..255).
+    pub texels_changed: usize,
+    pub mean_change: f64,
+}
+
+type SeamSample = (f64, [f64; 4], [f64; 4], [f64; 2], [f64; 2]);
+
+/// Samples every welded edge between two charts of the same flow region at the edge itself, from
+/// both sides, and compares the bilinear colors (they match when the texture is authored on the
+/// surface). With `tol` > 0, nudges GUTTER texels (never inside texels) so both sides meet at their
+/// mean where they differ by more than `tol` (Lab), then measures again.
+#[allow(clippy::too_many_arguments)]
+pub fn seam_stitch(hs: &HairSet, fl: &Flow, suv: &[[[f64; 2]; 3]], chart_of: &[usize], inside: &[bool], rgba: &mut [u8], size: usize, tol: f64) -> SeamReport {
+    let nb = neighbors(hs);
+    let mut pairs = Vec::new();
+    for a in 0..hs.tris.len() {
+        for &(bt, e) in &nb[a] {
+            if bt > a && chart_of[a] != chart_of[bt] && fl.region[a] == fl.region[bt] {
+                pairs.push((a, bt, e));
+            }
+        }
+    }
+    let pt = |t: usize, e: (usize, usize), f: f64| -> Option<[f64; 2]> {
+        let c = hs.wt[t];
+        let k0 = c.iter().position(|&x| x == e.0)?;
+        let k1 = c.iter().position(|&x| x == e.1)?;
+        let (q0, q1) = (suv[t][k0], suv[t][k1]);
+        Some([q0[0] + (q1[0] - q0[0]) * f, q0[1] + (q1[1] - q0[1]) * f])
+    };
+    let measure = |rgba: &[u8]| -> Vec<SeamSample> {
+        let mut v = Vec::new();
+        for &(a, bt, e) in &pairs {
+            let (Some(a0), Some(a1)) = (pt(a, e, 0.0), pt(a, e, 1.0)) else { continue };
+            let n = (((a1[0] - a0[0]) * size as f64).hypot((a1[1] - a0[1]) * size as f64)).ceil().max(1.0) as usize;
+            for s in 0..n {
+                let f = (s as f64 + 0.5) / n as f64;
+                let (Some(pa), Some(pb)) = (pt(a, e, f), pt(bt, e, f)) else { continue };
+                let ca = sample_level(size, size, rgba, pa[0], pa[1]);
+                let cb = sample_level(size, size, rgba, pb[0], pb[1]);
+                if ca[3] < 128.0 || cb[3] < 128.0 {
+                    continue;
+                }
+                let d = delta_e(lab([ca[0], ca[1], ca[2]]), lab([cb[0], cb[1], cb[2]]));
+                v.push((d, ca, cb, pa, pb));
+            }
+        }
+        v
+    };
+    let lim = tol.max(2.0);
+    let stats = |v: &[SeamSample]| {
+        let n = v.len().max(1) as f64;
+        (v.iter().map(|x| x.0).sum::<f64>() / n, v.iter().map(|x| x.0).fold(0.0, f64::max), v.iter().filter(|x| x.0 > lim).count())
+    };
+    let before = measure(rgba);
+    let (mb, xb, ob) = stats(&before);
+    let mut rep = SeamReport { points: before.len(), mean_before: mb, max_before: xb, over_before: ob, mean_after: mb, max_after: xb, over_after: ob, ..Default::default() };
+    if tol <= 0.0 {
+        return rep;
+    }
+    // Desired change per gutter texel, averaged over the seam points that touch it.
+    let mut want: HashMap<usize, ([f64; 3], f64)> = HashMap::new();
+    for &(d, ca, cb, pa, pb) in &before {
+        if d <= tol {
+            continue;
+        }
+        let target = [(ca[0] + cb[0]) * 0.5, (ca[1] + cb[1]) * 0.5, (ca[2] + cb[2]) * 0.5];
+        for (p, c) in [(pa, ca), (pb, cb)] {
+            let x = p[0] * size as f64 - 0.5;
+            let y = p[1] * size as f64 - 0.5;
+            let (x0, y0) = (x.floor() as i64, y.floor() as i64);
+            let (fx, fy) = (x - x.floor(), y - y.floor());
+            let taps = [(0i64, 0i64, (1.0 - fx) * (1.0 - fy)), (1, 0, fx * (1.0 - fy)), (0, 1, (1.0 - fx) * fy), (1, 1, fx * fy)];
+            let idx = |t: &(i64, i64, f64)| -> Option<usize> {
+                let (xx, yy) = (x0 + t.0, y0 + t.1);
+                (xx >= 0 && yy >= 0 && (xx as usize) < size && (yy as usize) < size).then(|| yy as usize * size + xx as usize)
+            };
+            let gw: f64 = taps.iter().filter(|t| idx(t).is_some_and(|i| !inside[i])).map(|t| t.2).sum();
+            if gw < 0.25 {
+                continue;
+            }
+            for t in &taps {
+                let Some(i) = idx(t) else { continue };
+                if inside[i] || t.2 <= 0.0 {
+                    continue;
+                }
+                let e = want.entry(i).or_insert(([0.0; 3], 0.0));
+                for k in 0..3 {
+                    e.0[k] += (target[k] - c[k]) / gw * t.2;
+                }
+                e.1 += t.2;
+            }
+        }
+    }
+    let mut total = 0.0;
+    for (&i, &(d, w)) in &want {
+        let mut ch = 0.0;
+        for k in 0..3 {
+            let old = rgba[i * 4 + k] as f64;
+            let new = (old + d[k] / w.max(1e-9)).round().clamp(0.0, 255.0);
+            ch += (new - old).abs() / 3.0;
+            rgba[i * 4 + k] = new as u8;
+        }
+        total += ch;
+    }
+    rep.texels_changed = want.len();
+    rep.mean_change = total / want.len().max(1) as f64;
+    let after = measure(rgba);
+    let (ma, xa, oa) = stats(&after);
+    rep.mean_after = ma;
+    rep.max_after = xa;
+    rep.over_after = oa;
+    rep
+}
+
+/// Share of hair texels at alpha >= 0.5 per mip level (box mips). `mask` flags level-0 hair texels;
+/// a smaller level's texel counts by the share of its footprint in the mask. A cutout that keeps
+/// its coverage at every mip keeps its outline at distance.
+pub fn alpha_coverage(tex: &crate::Texture, mask: &[bool], levels: usize) -> Vec<f64> {
+    let mut out = Vec::new();
+    let mut frac: Vec<f32> = mask.iter().map(|&h| if h { 1.0 } else { 0.0 }).collect();
+    let (mut mw, mut mh) = (tex.w, tex.h);
+    for l in 0..levels.min(tex.levels()) {
+        let (w, h, px) = tex.level(l);
+        if l > 0 {
+            let mut f2 = vec![0.0f32; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let at = |xx: usize, yy: usize| frac[yy.min(mh - 1) * mw + xx.min(mw - 1)];
+                    f2[y * w + x] = 0.25 * (at(2 * x, 2 * y) + at(2 * x + 1, 2 * y) + at(2 * x, 2 * y + 1) + at(2 * x + 1, 2 * y + 1));
+                }
+            }
+            frac = f2;
+            (mw, mh) = (w, h);
+        }
+        let (mut cov, mut tot) = (0.0f64, 0.0f64);
+        for i in 0..w * h {
+            if frac[i] <= 0.0 {
+                continue;
+            }
+            tot += frac[i] as f64;
+            if px[i * 4 + 3] >= 128 {
+                cov += frac[i] as f64;
+            }
+        }
+        out.push(if tot > 0.0 { cov / tot } else { 0.0 });
     }
     out
 }
