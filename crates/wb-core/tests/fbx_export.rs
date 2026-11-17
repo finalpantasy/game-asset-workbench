@@ -223,7 +223,7 @@ fn check_with_own_reader(model: &Model, ex: &fbx::Export) -> fbx::Scene {
 
 fn compare_meshes(model: &Model, ex: &fbx::Export, scene: &fbx::Scene) {
     let s = ex.scale;
-    let kept: Vec<&wb_core::model::Mesh> = model.meshes.iter().filter(|m| !ex.skipped_meshes.contains(&m.name)).collect();
+    let kept: Vec<&wb_core::model::Mesh> = fbx::export_order(&model.meshes.iter().map(|m| m.name.as_str()).collect::<Vec<_>>()).into_iter().map(|i| &model.meshes[i]).filter(|m| !ex.skipped_meshes.contains(&m.name)).collect();
     assert_eq!(scene.meshes.len(), kept.len());
     for (sm, gm) in scene.meshes.iter().zip(&kept) {
         assert_eq!(sm.name, gm.name.replace(['#', ':'], "_"));
@@ -295,7 +295,7 @@ fn compare_bind_poses(model: &Model, ex: &fbx::Export, scene: &fbx::Scene) {
 fn check_with_ufbx(path: &Path, model: &Model, ex: &fbx::Export) {
     let root = ufbx::load_file(path.to_str().unwrap(), ufbx::LoadOpts::default()).unwrap_or_else(|e| panic!("ufbx cannot read {}: {e:?}", path.display()));
     let scene: &ufbx::Scene = &root;
-    let kept: Vec<&wb_core::model::Mesh> = model.meshes.iter().filter(|m| !ex.skipped_meshes.contains(&m.name)).collect();
+    let kept: Vec<&wb_core::model::Mesh> = fbx::export_order(&model.meshes.iter().map(|m| m.name.as_str()).collect::<Vec<_>>()).into_iter().map(|i| &model.meshes[i]).filter(|m| !ex.skipped_meshes.contains(&m.name)).collect();
     assert_eq!(scene.meshes.len(), kept.len(), "mesh count");
     // bone nodes by name, in file order: bone000.. then no extras
     let mut bone_names: Vec<String> = scene.nodes.iter().filter(|n| n.element.name.starts_with("bone")).map(|n| n.element.name.to_string()).collect();
@@ -465,6 +465,29 @@ fn real_file(rel: &str, name: &str) {
     assert_eq!(ex.bones, 27);
     assert!(ex.meshes.iter().all(|m| m.max_influences <= 4));
     eprintln!("{name}: {} bones, meshes {:?}, skipped {:?}, euler {:.2e}, bind {:.2e}", ex.bones, ex.meshes.iter().map(|m| (m.name.clone(), m.vertices, m.triangles)).collect::<Vec<_>>(), ex.skipped_meshes, ex.euler_error, ex.bind_error);
+}
+
+#[test]
+fn zidane_overlays_in_stock_order() {
+    // Memoria wires the blink to a material by renderer index; stock Zidane's renderers are
+    // battle_model0, battle_model1, mesh0, mesh1, so the overlays must come first in the FBX.
+    let p = exp("exports/Zidane-idle-overlays.glb");
+    let Ok(bytes) = std::fs::read(&p) else {
+        eprintln!("skip: {} not found", p.display());
+        return;
+    };
+    let ex = export_and_check(&bytes, "zidane-overlays", &ExportOptions { keep_overlays: true, ..Default::default() });
+    let names: Vec<&str> = ex.meshes.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, ["battle_model0", "battle_model1", "mesh0", "mesh1"]);
+    let scene = fbx::read_scene(&ex.fbx).unwrap();
+    let in_file: Vec<&str> = scene.meshes.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(in_file, names);
+}
+
+#[test]
+fn export_order_puts_overlays_first() {
+    assert_eq!(fbx::export_order(&["mesh0", "mesh1", "battle_model1", "battle_model0"]), vec![3, 2, 0, 1]);
+    assert_eq!(fbx::export_order(&["a", "b"]), vec![0, 1]);
 }
 
 #[test]

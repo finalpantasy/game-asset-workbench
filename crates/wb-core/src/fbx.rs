@@ -416,6 +416,17 @@ fn gltf_normals(model: &Model) -> Vec<Option<Vec<[f64; 3]>>> {
     out
 }
 
+/// Order meshes are written in. Memoria wires a texture animation (the eye blink) to a material by its
+/// index in `GetComponentsInChildren<SkinnedMeshRenderer>()` order, and stock Zidane is `battle_model0`,
+/// `battle_model1`, `mesh0`, `mesh1` with the blink on index 3. So overlay meshes go first (battle_model,
+/// then field_model); every other mesh keeps its GLB order.
+pub fn export_order(names: &[&str]) -> Vec<usize> {
+    let rank = |n: &str| if n.starts_with("battle_model") { 0 } else if n.starts_with("field_model") { 1 } else { 2 };
+    let mut order: Vec<usize> = (0..names.len()).collect();
+    order.sort_by_key(|&i| (rank(names[i]), if rank(names[i]) < 2 { names[i] } else { "" }, i));
+    order
+}
+
 pub fn export_fbx(model: &Model, opts: &ExportOptions) -> Result<Export, String> {
     let glb = &model.glb;
     let extras = glb.json.get("asset").and_then(|a| a.get("extras"));
@@ -575,7 +586,8 @@ pub fn export_fbx(model: &Model, opts: &ExportOptions) -> Result<Export, String>
     let mut tex_node: HashMap<usize, i64> = HashMap::new(); // image index -> texture object id
     let mut exported = Vec::new();
     let mut skipped = Vec::new();
-    for (mi, m) in model.meshes.iter().enumerate() {
+    for mi in export_order(&model.meshes.iter().map(|m| m.name.as_str()).collect::<Vec<_>>()) {
+        let m = &model.meshes[mi];
         if !opts.keep_overlays && m.name.starts_with("battle_model") {
             skipped.push(m.name.clone());
             continue;

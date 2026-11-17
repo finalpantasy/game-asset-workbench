@@ -18,6 +18,8 @@ mod requestcmd;
 mod viewscmd;
 mod boundarycmd;
 mod fbxcmd;
+mod weightscmd;
+mod deformcmd;
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -62,7 +64,8 @@ const USAGE: &str = "gaw (Game Asset Workbench, formerly zidane-inspector): open
       --keep-stock SHEET:x0,y0,x1,y1  leave that box (stock-sheet pixels) where it is: the
                                       triangles that sample it keep stock UVs, its paint is kept,
                                       nothing is packed over it. Repeatable.
-      --keep-blink                    the same for field Zidane's two eye-blink boxes on 98_0.
+      --keep-blink                    the same for field Zidane's three eye-blink boxes on 98_0 (closed-eye
+                                      source, open-eye source, eye target).
       --v8                            all four additions below at once.
       --orient-bones                  turn each piece so its dominant bind-pose bone runs up the page.
       --mirror-pairs                  lay each left/right pair out as an exact reflection (same scale);
@@ -185,6 +188,7 @@ fn main() {
         Some(c @ "requests") => (c.to_owned(), all[1..].to_vec()),
         Some(c @ "views") => (c.to_owned(), all[1..].to_vec()),
         Some(c @ "fbx") => (c.to_owned(), all[1..].to_vec()),
+        Some(c @ ("weights" | "deform-check")) => (c.to_owned(), all[1..].to_vec()),
         // A word that is not a file is a mistyped command: say so instead of opening the window.
         Some(c) if !c.starts_with("--") && !Path::new(c).exists() => ("help".to_owned(), vec![]),
         _ => ("view".to_owned(), all.clone()),
@@ -201,6 +205,8 @@ fn main() {
         println!("{}", requestcmd::REQUESTS_USAGE);
         println!("{}", viewscmd::VIEWS_USAGE);
         println!("{}", fbxcmd::FBX_USAGE);
+        println!("{}", weightscmd::WEIGHTS_USAGE);
+        println!("{}", deformcmd::DEFORM_USAGE);
         std::process::exit(2);
     }
     let args = Args(rest);
@@ -221,6 +227,8 @@ fn main() {
         "requests" => requestcmd::requests_cmd(&args),
         "views" => viewscmd::views_cmd(&args),
         "fbx" => fbxcmd::fbx_cmd(&args),
+        "weights" => weightscmd::weights_cmd(&args),
+        "deform-check" => deformcmd::deform_cmd(&args),
         "roundtrip" => roundtrip(&args),
         "render" => render_cmd(&args),
         "shells" => strapcmd::shells_cmd(&args),
@@ -242,6 +250,8 @@ fn main() {
             println!("{}", requestcmd::REQUESTS_USAGE);
             println!("{}", viewscmd::VIEWS_USAGE);
             println!("{}", fbxcmd::FBX_USAGE);
+            println!("{}", weightscmd::WEIGHTS_USAGE);
+            println!("{}", deformcmd::DEFORM_USAGE);
             Ok(())
         }
     };
@@ -451,10 +461,6 @@ fn layout_size(args: &Args) -> Result<usize, String> {
     Ok(size)
 }
 
-/// Field Zidane's eye blink (measured in the game, 512-px PNG coordinates on the head sheet):
-/// the closed-eye art at the source is copied over the eyes at the target.
-const ZIDANE_BLINK: [(&str, [f64; 4]); 2] = [("98_0", [224.0, 216.0, 272.0, 248.0]), ("98_0", [32.0, 116.0, 80.0, 148.0])];
-
 /// `--keep-stock SHEET:x0,y0,x1,y1` (repeatable, pixels of the stock sheet) and `--keep-blink`.
 fn keep_boxes(args: &Args, input: &Path) -> Result<Vec<wb_core::pattern::Keep>, String> {
     let mut spec: Vec<(String, [f64; 4], f64)> = Vec::new();
@@ -468,8 +474,9 @@ fn keep_boxes(args: &Args, input: &Path) -> Result<Vec<wb_core::pattern::Keep>, 
         spec.push((sheet.to_string(), [x0, y0, x1, y1], 0.0));
     }
     if args.flag("--keep-blink") {
-        // Measured at 512; scaled to the sheet's own size below.
-        spec.extend(ZIDANE_BLINK.iter().map(|(s, b)| (s.to_string(), *b, 512.0)));
+        // Field Zidane's three blink boxes (closed-eye source, open-eye source, eye target; see
+        // `wb_core::blink`), measured at 512 and scaled to the sheet's own size below.
+        spec.extend(wb_core::blink::ZIDANE_BOXES.iter().map(|b| (wb_core::blink::SHEET.to_string(), b.px, wb_core::blink::SIZE)));
     }
     if spec.is_empty() {
         return Ok(Vec::new());

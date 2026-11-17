@@ -88,10 +88,12 @@ Keys in the window: Space plays or pauses, 1/2/3 pick field, battle or close-up,
 | `hair file.glb --out-dir DIR` | Hair card retexture and optional geometry rebuild |
 | `shells`, `strap-rebuild`, `strap-sweep` | Loose-piece report, belt-strap rebuild, strap check sheets |
 | `ship SHEET.png --out-dir DIR` | Write Memoria raw textures with mips |
-| `defects cand.glb --out-dir DIR --ref ref.glb` | Find places to fix: smear, flat patches, specks, jagged edges, seam stripes, direction breaks. Writes `defects.json` and one picture sheet per kind |
+| `defects cand.glb --out-dir DIR --ref ref.glb` | Find places to fix: smear, flat patches, specks, jagged edges, seam stripes, direction breaks, hard edges where one hair card lies on another. Writes `defects.json` and one picture sheet per kind |
 | `gate --spec gate.json` | Run `defects` on a reference and a candidate, apply per-kind limits and marked places, print PASS or FAIL per rule, exit 1 on a fail |
 | `closelook --marks marks.json --reference ref.glb --candidates a.glb ..` | The same close-up for every marked place, reference and candidates side by side, so a look by eye can be repeated |
 | `fbx file.glb --out DIR` | Write the FBX that Memoria loads as a custom model, with the `boneNNN` skeleton. `--mod-layout`, `--readback` |
+| `weights new.glb --from ref.glb --out OUT.glb` | Copy bone weights from a reference model onto a new mesh. Refuses a skeleton that doesn't match. `--adopt-skeleton` gives a bare mesh the reference skeleton; `--repair` and `--polish` fix stretched joints |
+| `deform-check model.glb --ref ref.glb` | Pose the model through every clip and flag stretched or squashed triangles, bad weights and body parts passing through each other, measured against the reference |
 | `boundary-check`, `paint-fix`, `line-repaint` | Check and repaint where two pieces meet (belt over shirt, strap edges) |
 | `requests [list\|show NAME]` | List and print the requests saved from Mark & fix |
 | `requests locks NAME cand.glb` | Check a candidate against the places a request locked. Prints "Locks held", or the places that moved and exits 1 |

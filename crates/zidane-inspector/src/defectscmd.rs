@@ -24,16 +24,22 @@ pub const DEFECTS_USAGE: &str = "  gaw defects CANDIDATE.glb --out-dir NEW_DIR [
       reference), flat patches (almost no colour variance: plastic), specks (tiny cut-off fragments in
       the render or opaque scraps in the texture), alpha stipple (alpha near one half and pin holes
       that the cutout turns into noise) and layer direction cuts (strand direction jumping where
-      one layer ends and the next begins) and lock-scale patches (fine wood-grain stripes with no broad
-      locks under them, against the reference). Draws close-ups and game-distance views, maps every finding back to triangles, UV
+      one layer ends and the next begins), card edges (two unwelded cards meeting flush with a colour
+      step and strands crossing the edge, the cut the layer test misses) and lock-scale patches (fine
+      wood-grain stripes with no broad locks under them, against the reference). Draws close-ups and game-distance views, maps every finding back to triangles, UV
       island and texel box, and writes defects.json (each defect: kind, score, view, screen box,
       triangles, island, texel box; score 1.0 = at the calibrated limit), one crop sheet per kind with
       numbered markers (sheet-<kind>.png) and the views behind them. Prints one line per kind.
       --part NAME[,NAME]       only these triangles: hair, a kit part, a bone group (head, arm_L, ..) or a mesh name
       --ref REF.glb            fit the cameras to REF's part and run the same checks on it for comparison
       --palette self|ref       discoloration palette from the candidate (default) or from --ref
+      --baseline ref|self      smear-blur, flat-patch and lock-scale medians from --ref (default) or from each
+                               model's own tiles (the candidate against itself, the reference against itself):
+                               for a new painted style that is cleaner than the reference's textures
+      --cut-regions skip|LAB   layer cuts skip the boundary between two UV islands whose mean colours
+                               differ by LAB (skip = 20): a change of material (glove to sleeve), not a cut
       --kinds a,b              only these detectors: jagged-edge, discoloration, seam-stripe, direction-break, dark-gutter,
-                               smear-blur, flat-patch, speck, alpha-stipple, layer-direction-cut, lock-scale
+                               smear-blur, flat-patch, speck, alpha-stipple, layer-direction-cut, lock-scale, card-edge
       --probe VIEW:X:Y         print the mesh, triangle, island, UV, texel and alpha neighbourhood under one pixel of a view
       --all-views              also write every drawn view as a picture (views/), not only those with a defect
       --top N                  defects drawn per crop sheet (default 12)
@@ -43,7 +49,7 @@ pub const DEFECTS_USAGE: &str = "  gaw defects CANDIDATE.glb --out-dir NEW_DIR [
 
 struct A<'a>(&'a [String]);
 
-const VALUE_OPTS: [&str; 8] = ["--ref", "--part", "--parts", "--out-dir", "--palette", "--kinds", "--top", "--probe"];
+const VALUE_OPTS: [&str; 10] = ["--ref", "--part", "--parts", "--out-dir", "--palette", "--kinds", "--top", "--probe", "--baseline", "--cut-regions"];
 
 impl A<'_> {
     fn opt(&self, k: &str) -> Option<&str> {
@@ -270,7 +276,7 @@ fn bases_from(g: &Grids) -> Bases {
     Bases { b16: f(&g.t16), b8: f(&g.t8), sb: dx::ScaleBase::from_grids(&g.scale) }
 }
 
-fn analyze(model: &Model, tex: &[Option<Texture>], keep: &Keep, drawn: &[Drawn], pose: &[Vec<[f32; 3]>], pal: &Palette, kinds: &[Kind], want_dir: bool, grids: &Grids, bases: &Bases) -> Analysis {
+fn analyze(model: &Model, tex: &[Option<Texture>], keep: &Keep, drawn: &[Drawn], pose: &[Vec<[f32; 3]>], pal: &Palette, kinds: &[Kind], want_dir: bool, grids: &Grids, bases: &Bases, regions: Option<&dx::CutRegions>) -> Analysis {
     let kg = dx::keep_global(model, keep);
     let ctxs: Vec<ShotCtx> = drawn.iter().map(|d| ShotCtx { name: d.name.clone(), px: d.px, cam: d.cam, pose, shot: &d.shot }).collect();
     let mut loads: BTreeMap<Kind, Load> = BTreeMap::new();
@@ -281,6 +287,7 @@ fn analyze(model: &Model, tex: &[Option<Texture>], keep: &Keep, drawn: &[Drawn],
     let (mut part_px, mut outlier_px) = (0usize, 0usize);
     let (mut blur_measured, mut blur_tiles, mut flat_measured, mut flat_tiles) = (0usize, 0usize, 0usize, 0usize);
     let (mut edge_px, mut edge_flagged) = (0usize, 0usize);
+    let (mut cedge_px, mut cedge_flagged) = (0usize, 0usize);
     let (mut grain_measured, mut grain_tiles) = (0usize, 0usize);
     let (mut speck_px, mut speck_frag, mut speck_dots, mut close_part_px) = (0usize, 0usize, 0usize, 0usize);
     let want = |k: Kind| kinds.contains(&k);
@@ -314,9 +321,15 @@ fn analyze(model: &Model, tex: &[Option<Texture>], keep: &Keep, drawn: &[Drawn],
                 }
             }
             if want(Kind::LayerCut) {
-                let s = dx::layer_edges(model, tex, sc, &kg);
+                let s = dx::layer_edges_with(model, tex, sc, &kg, regions);
                 edge_px += s.boundary_px;
                 edge_flagged += s.flagged_px;
+                screen.extend(s.defects);
+            }
+            if want(Kind::CardEdge) {
+                let s = dx::card_edges(model, tex, sc, &kg);
+                cedge_px += s.boundary_px;
+                cedge_flagged += s.flagged_px;
                 screen.extend(s.defects);
             }
             if want(Kind::Speck) {
@@ -358,6 +371,9 @@ fn analyze(model: &Model, tex: &[Option<Texture>], keep: &Keep, drawn: &[Drawn],
     }
     if want(Kind::Grain) {
         loads.insert(Kind::Grain, Load { percent: pct(grain_tiles, grain_measured), measured: grain_measured as f64, flagged: grain_tiles as f64, extra: vec![("baseline_fibre_share".into(), bases.sb.global)] });
+    }
+    if want(Kind::CardEdge) {
+        loads.insert(Kind::CardEdge, Load { percent: pct(cedge_flagged, cedge_px), measured: cedge_px as f64, flagged: cedge_flagged as f64, extra: vec![] });
     }
     if want(Kind::LayerCut) {
         loads.insert(Kind::LayerCut, Load { percent: pct(edge_flagged, edge_px), measured: edge_px as f64, flagged: edge_flagged as f64, extra: vec![] });
@@ -703,7 +719,27 @@ pub fn defects_cmd(args: &Args) -> Result<(), String> {
     // against the candidate's own medians (which hides a candidate that is flat everywhere).
     let cgrids = close_grids(&cand, &ckeep, &drawn, &pose);
     let rgrids = ref_drawn.as_ref().map(|(m, _, rd)| close_grids(m, rkeep.as_ref().unwrap(), rd, &pose_of(m)));
-    let bases = bases_from(rgrids.as_ref().unwrap_or(&cgrids));
+    // `--baseline self`: the candidate is measured against its own medians and the reference against
+    // its own, so a clean painted model is not judged against the reference's noisy texture style.
+    let self_base = match a.opt("--baseline") {
+        None | Some("ref") => false,
+        Some("self") => true,
+        Some(o) => return Err(format!("--baseline: {o} (use self or ref)")),
+    };
+    let bases = bases_from(if self_base { &cgrids } else { rgrids.as_ref().unwrap_or(&cgrids) });
+    let rbases = bases_from(rgrids.as_ref().unwrap_or(&cgrids));
+    // `--cut-regions skip|LAB`: layer cuts skip the boundary between two UV islands whose mean
+    // colours differ by LAB (default `dx::CUT_REGION_DE`): a change of material, not a cut.
+    let cut_de: Option<f32> = match a.opt("--cut-regions") {
+        None | Some("off") => None,
+        Some("skip") => Some(dx::CUT_REGION_DE as f32),
+        Some(v) => Some(v.parse::<f32>().map_err(|_| format!("--cut-regions: {v} (use skip, off or a Lab number)"))?),
+    };
+    let cregions = cut_de.map(|d| dx::cut_regions(&cand, &ctex, d));
+    let rregions = match (&ref_drawn, cut_de) {
+        (Some((m, rt, _)), Some(d)) => Some(dx::cut_regions(m, rt, d)),
+        _ => None,
+    };
     if a.flag("--dump-tiles") {
         // Per close view and tile: how many times less contrast across the strands ("blur") and less
         // colour variance ("flat") than the baseline, the strand axis in degrees and its coherence.
@@ -738,14 +774,14 @@ pub fn defects_cmd(args: &Args) -> Result<(), String> {
         std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
         std::fs::write(out.join("tiles.json"), serde_json::to_vec(&j).unwrap()).map_err(|e| format!("tiles.json: {e}"))?;
     }
-    let mut an = analyze(&cand, &ctex, &ckeep, &drawn, &pose, &pal, &kinds, want_dir, &cgrids, &bases);
+    let mut an = analyze(&cand, &ctex, &ckeep, &drawn, &pose, &pal, &kinds, want_dir, &cgrids, &bases, cregions.as_ref());
     if rgrids.is_none() {
         an.notes.push("smear-blur and flat-patch compare with this part's own median (no --ref): a part that is smeared or flat everywhere will not show".into());
     }
     let ref_an = match (&ref_drawn, &rgrids) {
         (Some((m, rt, rd)), Some(rg)) => {
             let rp = pose_of(m);
-            Some(analyze(m, rt, rkeep.as_ref().unwrap(), rd, &rp, &pal, &kinds, want_dir, rg, &bases))
+            Some(analyze(m, rt, rkeep.as_ref().unwrap(), rd, &rp, &pal, &kinds, want_dir, rg, &rbases, rregions.as_ref()))
         }
         _ => None,
     };
@@ -794,6 +830,7 @@ pub fn defects_cmd(args: &Args) -> Result<(), String> {
                 Kind::Stipple => [0, 128, 255, 255],
                 Kind::LayerCut => [255, 0, 128, 255],
                 Kind::Grain => [128, 255, 0, 255],
+                Kind::CardEdge => [0, 200, 255, 255],
             }
         };
         for dr in &drawn {

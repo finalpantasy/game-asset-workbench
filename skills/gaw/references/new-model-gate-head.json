@@ -1,0 +1,109 @@
+{
+ "name": "New painted model head gate (own-style baseline)",
+ "about": "Run: gaw gate --spec skills/gaw/references/new-model-gate-head.json --out-dir NEW CANDIDATE.glb (from the Modding folder). Bone group head of a new painted model against stock. Like the hair gate every rule is relative to stock, but smear-blur and flat-patch compare each model with its own median tile (baseline self) and layer cuts skip boundaries between UV islands of different material (cut_regions skip), so clean painted cloth is not judged against stock's noisy textures.",
+ "part": "head",
+ "reference": "exports/Zidane-idle.glb",
+ "rules": [
+  {
+   "id": "seam-stripe load at most 1.0x stock",
+   "type": "ratio",
+   "kinds": [
+    "seam-stripe"
+   ],
+   "measure": "load",
+   "max_x": 1.0,
+   "floor": 0.05,
+   "why": "color steps across UV seams"
+  },
+  {
+   "id": "dark-gutter load at most 1.0x stock",
+   "type": "ratio",
+   "kinds": [
+    "dark-gutter"
+   ],
+   "measure": "load",
+   "max_x": 1.0,
+   "floor": 0.02,
+   "why": "padding or mip bleed at island borders"
+  },
+  {
+   "id": "jagged-edge load at most 1.5x stock",
+   "type": "ratio",
+   "kinds": [
+    "jagged-edge"
+   ],
+   "measure": "load",
+   "max_x": 1.5,
+   "floor": 0.01,
+   "why": "stair-stepped silhouettes and cutout edges"
+  },
+  {
+   "id": "discoloration load at most 1.0x stock",
+   "type": "ratio",
+   "kinds": [
+    "discoloration"
+   ],
+   "measure": "load",
+   "max_x": 1.0,
+   "floor": 0.01,
+   "why": "off-palette patches"
+  },
+  {
+   "id": "speck count at most 1.5x stock",
+   "type": "ratio",
+   "kinds": [
+    "speck"
+   ],
+   "measure": "count",
+   "max_x": 1.5,
+   "floor": 2,
+   "why": "dots and cut-off shards"
+  },
+  {
+   "id": "alpha-stipple count at most 1.0x stock",
+   "type": "ratio",
+   "kinds": [
+    "alpha-stipple"
+   ],
+   "measure": "count",
+   "max_x": 1.0,
+   "floor": 1,
+   "why": "pin holes in the cutout"
+  },
+  {
+   "id": "layer-direction-cut count at most 1.5x stock",
+   "type": "ratio",
+   "kinds": [
+    "layer-direction-cut"
+   ],
+   "measure": "count",
+   "max_x": 1.5,
+   "floor": 2,
+   "why": "layers that stop dead; boundaries between islands of different material are not counted"
+  },
+  {
+   "id": "smear-blur load at most 1.5x stock",
+   "type": "ratio",
+   "kinds": [
+    "smear-blur"
+   ],
+   "measure": "load",
+   "max_x": 1.5,
+   "floor": 0.05,
+   "why": "detail smeared away, against each model's own median tile"
+  },
+  {
+   "id": "flat-patch load at most 2.0x stock",
+   "type": "ratio",
+   "kinds": [
+    "flat-patch"
+   ],
+   "measure": "load",
+   "max_x": 2.0,
+   "floor": 0.05,
+   "why": "plastic one-tone areas, against each model's own median tile"
+  }
+ ],
+ "baseline": "self",
+ "cut_regions": "skip"
+}

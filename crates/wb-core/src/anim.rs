@@ -321,3 +321,91 @@ pub fn skin(mesh: &Mesh, joints: &[Mat4]) -> Vec<[f32; 3]> {
         })
         .collect()
 }
+
+/// Local translation, rotation (quaternion x, y, z, w) and scale of one joint node.
+pub type Local = ([f32; 3], [f32; 4], [f32; 3]);
+
+impl Rig {
+    /// Local transform of every joint node for a clip at `t` seconds (None = the rest pose), in joint
+    /// order. Joint nodes that carry a `matrix` instead of translation, rotation and scale read as
+    /// identity unless a clip animates them.
+    pub fn joint_locals(&self, clip: Option<usize>, t: f32) -> Vec<Local> {
+        let mut local: Vec<Node> = self.nodes.clone();
+        if let Some(c) = clip.and_then(|c| self.clips.get(c)) {
+            let t = if c.duration > 0.0 { t.rem_euclid(c.duration) } else { 0.0 };
+            for ch in &c.channels {
+                let v = sample(ch, t);
+                if let Some(n) = local.get_mut(ch.node) {
+                    match ch.path {
+                        PathKind::T => n.t = [v[0], v[1], v[2]],
+                        PathKind::R => n.r = v,
+                        PathKind::S => n.s = [v[0], v[1], v[2]],
+                    }
+                }
+            }
+        }
+        self.joints.iter().map(|&j| (local[j].t, local[j].r, local[j].s)).collect()
+    }
+
+    /// Joint matrices (world * inverse bind) when the joint nodes take the given local transforms
+    /// (one per joint, as `joint_locals` returns them, possibly from another model with the same
+    /// skeleton). Nodes that are not joints keep their rest transform.
+    pub fn joint_matrices_with(&self, locals: &[Local]) -> Vec<Mat4> {
+        let mut local: Vec<Node> = self.nodes.clone();
+        for (k, &j) in self.joints.iter().enumerate() {
+            if let (Some(l), Some(n)) = (locals.get(k), local.get_mut(j)) {
+                n.matrix = None;
+                n.t = l.0;
+                n.r = l.1;
+                n.s = l.2;
+            }
+        }
+        let mut world = vec![IDENTITY; local.len()];
+        for &i in &self.order {
+            let n = &local[i];
+            let m = n.matrix.unwrap_or_else(|| from_trs(n.t, n.r, n.s));
+            world[i] = match n.parent {
+                Some(p) => mat_mul(&world[p], &m),
+                None => m,
+            };
+        }
+        self.joints.iter().enumerate().map(|(k, &j)| mat_mul(&world[j], &self.ibm[k])).collect()
+    }
+
+    /// World matrix of every joint node at rest (the bind pose), in joint order.
+    pub fn rest_joint_world(&self) -> Vec<Mat4> {
+        let mut world = vec![IDENTITY; self.nodes.len()];
+        for &i in &self.order {
+            let n = &self.nodes[i];
+            let m = n.matrix.unwrap_or_else(|| from_trs(n.t, n.r, n.s));
+            world[i] = match n.parent {
+                Some(p) => mat_mul(&world[p], &m),
+                None => m,
+            };
+        }
+        self.joints.iter().map(|&j| world[j]).collect()
+    }
+
+    /// Inverse bind matrices, in joint order.
+    pub fn inverse_binds(&self) -> &[Mat4] {
+        &self.ibm
+    }
+
+    /// For each joint, the index (in joint order) of its nearest ancestor that is also a joint.
+    pub fn joint_parents(&self) -> Vec<Option<usize>> {
+        let joint_of_node: std::collections::HashMap<usize, usize> = self.joints.iter().enumerate().map(|(k, &j)| (j, k)).collect();
+        self.joints
+            .iter()
+            .map(|&j| {
+                let mut at = self.nodes[j].parent;
+                while let Some(p) = at {
+                    if let Some(&pk) = joint_of_node.get(&p) {
+                        return Some(pk);
+                    }
+                    at = self.nodes[p].parent;
+                }
+                None
+            })
+            .collect()
+    }
+}

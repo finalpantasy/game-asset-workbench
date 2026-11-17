@@ -86,7 +86,7 @@ fn readback(file: &Path, out: &Path, ex: &fbx::Export) -> Result<(), String> {
     let orig = Model::open(file)?;
     let mut back = Model::open(file)?;
 
-    let kept: Vec<usize> = (0..orig.meshes.len()).filter(|&i| !ex.skipped_meshes.contains(&orig.meshes[i].name)).collect();
+    let kept: Vec<usize> = fbx::export_order(&orig.meshes.iter().map(|m| m.name.as_str()).collect::<Vec<_>>()).into_iter().filter(|&i| !ex.skipped_meshes.contains(&orig.meshes[i].name)).collect();
     if scene.meshes.len() != kept.len() {
         return Err(format!("read-back: the FBX has {} meshes, the GLB {} (minus skipped)", scene.meshes.len(), kept.len()));
     }

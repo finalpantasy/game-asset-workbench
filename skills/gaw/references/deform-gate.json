@@ -1,0 +1,18 @@
+{
+ "name": "Skinned model deform gate",
+ "about": "Run: gaw gate --spec skills/gaw/references/deform-gate.json --out-dir NEW_DIR CANDIDATE.glb (from the Modding folder). Runs gaw deform-check once (clips, stretch, squash, volume, intersect, weights) against stock and judges each kind relative to what stock itself shows. No defects run.",
+ "defects": false,
+ "reference": "exports/Zidane-idle.glb",
+ "rules": [
+  {"id": "stretch load at most 1.5x stock", "type": "ratio", "check": "deform", "kinds": ["stretch"], "measure": "load", "max_x": 1.5, "floor": 0.5,
+   "why": "triangles pulled past the edge limit in some clip frame"},
+  {"id": "squash load at most 1.5x stock", "type": "ratio", "check": "deform", "kinds": ["squash"], "measure": "load", "max_x": 1.5, "floor": 0.5,
+   "why": "triangles crushed past the edge limit"},
+  {"id": "volume loss at most 1.5x stock", "type": "ratio", "check": "deform", "kinds": ["volume"], "measure": "load", "max_x": 1.5, "floor": 1.0,
+   "why": "candy-wrapper twists and joints that lose volume"},
+  {"id": "intersect load at most 1.5x stock", "type": "ratio", "check": "deform", "kinds": ["intersect"], "measure": "load", "max_x": 1.5, "floor": 0.5,
+   "why": "arm through torso and other new pass-throughs"},
+  {"id": "weights count none beyond stock", "type": "ratio", "check": "deform", "kinds": ["weights"], "measure": "count", "max_x": 1.0, "floor": 0.0,
+   "why": "vertices with no weight, bad sums or too many influences"}
+ ]
+}

@@ -27,6 +27,17 @@ pub const HAIR_USAGE: &str = "  gaw hair file.glb --out-dir NEW_FOLDER [options]
       flow UVs and texture on the new model. The stock mesh version goes to OUT/stock-mesh as a
       fallback. Options: --model-tris 3000, --row-stretch 1.5, --fold-deg 20, --alpha-cut 0.5
       (0 = keep the alpha cutout), --gap 0.5 (grid spacings; 0 = off), --model-smooth N (flow smoothing passes on the new mesh; 0, or 30 with --model-param solve), --model-param stock|solve (carry the stock strand solve over, or re-solve), --backfaces stock|drop|all.
+      --uv stock (without --rebuild-model): also writes OUT/stock-uv/NAME, the stock mesh with its
+      own UVs and only the sheet replaced: the same paint, sampled at the same surface points, at
+      --size. A texture-only change. Where the stock layout mirrors left and right onto the same
+      texels, the +x side is painted and the other side shows it mirrored. --uv-pad 6 (gutter
+      texels around each hair triangle; texels another part uses stay stock). --uv-cross 0.12
+      (model units, 0 = off): where one card lies on or passes through another, each takes a
+      share of the other's paint within R of its plane, more near its own open edge, so the edge
+      does not read as a cut. --uv-seam 24 (texels, 0 = off): blend across every edge two hair
+      triangles share in the stock layout, W texels either side, so paint runs on across folds.
+      --pick-maps: write only OUT/pick-VIEW.png and pick-VIEW.bin (480 x 480 i32, the mesh's
+      triangle index per pixel, -1 elsewhere) for the closelook turntable cameras, then stop.
       Look: --look stock|warm (warm = hue -15, chroma x1.25, L +12, contrast 0.6, clumps x1.5),
       --hue-shift DEG, --chroma-scale X, --lightness L, --contrast X, --clump W, --clump-jitter X,
       --wave A, --wave-len L (override the look; warm also sets clump jitter 0.8, wave x1.5 and
@@ -172,6 +183,44 @@ fn paste(dst: &mut [u8], dw: usize, ox: usize, oy: usize, src: &[u8], sw: usize,
 const VIEWS: [(&str, f32, f32); 8] =
     [("front", 0.0, 0.0), ("front-left", 45.0, 0.0), ("left", 90.0, 0.0), ("back-left", 135.0, 0.0), ("back", 180.0, 0.0), ("right", -90.0, 0.0), ("top", 0.0, 75.0), ("below", 0.0, -45.0)];
 
+/// `--pick-maps`: renders the close-up turntable cameras (fitted to the part before growing, the
+/// same cameras as `gaw closelook --camera turntable`) and writes, per view, `pick-VIEW.png` (the
+/// render) and `pick-VIEW.bin` (480 x 480 little-endian i32: the hair mesh's triangle index in file
+/// order, -1 for other meshes or background). Maps a pixel of a close-look crop to its triangle.
+fn pick_maps(model: &Model, mesh: usize, sel: &Select, out: &Path) -> Result<(), String> {
+    let m = &model.meshes[mesh];
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for (t, tri) in m.tris.iter().enumerate() {
+        if let Select::Mask(mask) = sel {
+            if !mask[t] {
+                continue;
+            }
+        }
+        for &v in tri {
+            for k in 0..3 {
+                lo[k] = lo[k].min(m.pos[v as usize][k]);
+                hi[k] = hi[k].max(m.pos[v as usize][k]);
+            }
+        }
+    }
+    let target: [f32; 3] = std::array::from_fn(|k| 0.5 * (lo[k] + hi[k]));
+    let ext = (0..3).map(|k| hi[k] - lo[k]).fold(0.0, f32::max);
+    let off = render::tri_offsets(model)[mesh] as i32;
+    let n = m.tris.len() as i32;
+    let tex = image_textures(model);
+    std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    for (name, yaw) in [("front", 0.0f32), ("left", 90.0), ("back", 180.0), ("right", -90.0)] {
+        let cam = Camera { yaw: std::f32::consts::PI + yaw.to_radians(), pitch: 0.0, dist: ext * 8.0, target, fov_y: 30f32.to_radians(), ortho: true, ortho_half: ext * 0.62 };
+        let o = render::Options { cam, w: 480, h: 480, background: ([58, 64, 76], [32, 34, 40]), filter: Filter::Smooth, positions: None };
+        let f = render::render(model, &tex, &o, &|_, _| None);
+        save_png(&out.join(format!("pick-{name}.png")), 480, 480, &f.rgba)?;
+        let bytes: Vec<u8> = f.pick.iter().flat_map(|&p| { let l = p - off; (if p >= 0 && l >= 0 && l < n { l } else { -1 }).to_le_bytes() }).collect();
+        std::fs::write(out.join(format!("pick-{name}.bin")), bytes).map_err(|e| e.to_string())?;
+    }
+    println!("wrote pick maps (front, left, back, right) to {}", out.display());
+    Ok(())
+}
+
 /// A turntable sheet: one row per model, one column per view. `px` = render size, `k` = enlargement.
 fn turntable(rows: &[(String, &Model, &[Option<Texture>])], hs: &HairSet, half: f32, px: usize, k: usize, title: &str) -> (usize, usize, Vec<u8>) {
     let tile = px * k;
@@ -198,8 +247,6 @@ fn turntable(rows: &[(String, &Model, &[Option<Texture>])], hs: &HairSet, half: 
     (w, h, out)
 }
 
-/// Field Zidane's eye-blink boxes on 98_0, in 512-pixel units: the closed-eye source and the eye target.
-const BLINK: [[f64; 4]; 2] = [[224.0, 216.0, 272.0, 248.0], [32.0, 116.0, 80.0, 148.0]];
 
 /// Mean Lab of a triangle's paint (texels with alpha >= 128), sampled at 15 points.
 fn tri_lab(model: &Model, mesh: usize, t: usize, tex: &Texture) -> Option<[f64; 3]> {
@@ -312,6 +359,9 @@ pub fn hair_cmd(args: &Args) -> Result<(), String> {
         }
         None => Select::All,
     };
+    if args.flag("--pick-maps") {
+        return pick_maps(&model, mesh, &sel, &out);
+    }
     // Grow the hair part: --include lists mesh triangles; --grow-part adds neighbors painted like
     // hair (hue, chroma and lightness near the hair's own) by edge connectivity.
     let mut grown = vec![false; model.meshes[mesh].tris.len()];
@@ -542,7 +592,8 @@ fn run(args: &Args, ri: &RunIn) -> Result<RunOut, String> {
         keep.push([p[0] / sc, p[1] / sc, p[2] / sc, p[3] / sc]);
     }
     if args.flag("--keep-blink") {
-        keep.extend(BLINK.iter().map(|b| [b[0] / 512.0, b[1] / 512.0, b[2] / 512.0, b[3] / 512.0]));
+        // Closed-eye source, open-eye source and eye target on 98_0 (`wb_core::blink`).
+        keep.extend(wb_core::blink::zidane_uv_boxes());
     }
     let say = |s: String| println!("  [{:5.1} s] {s}", t0.elapsed().as_secs_f64());
     say(format!(
@@ -887,6 +938,36 @@ fn run(args: &Args, ri: &RunIn) -> Result<RunOut, String> {
     let new_model = Model::from_bytes(&swapped.bytes)?;
     say(format!("wrote {}", glb_path.display()));
 
+    // Texture-only version: the same paint moved into the input's own UV layout (stock mesh only).
+    let mut stock_uv_model: Option<Model> = None;
+    if opt(args, "--uv") == Some("stock") && ri.stock_hs.is_none() {
+        let mut srgba = vec![0u8; size * size * 4];
+        for y in 0..size {
+            for x in 0..size {
+                let s = ((y * stock.h / size) * stock.w + x * stock.w / size) * 4;
+                srgba[(y * size + x) * 4..(y * size + x) * 4 + 4].copy_from_slice(&stock.rgba[s..s + 4]);
+            }
+        }
+        let stock_uv: Vec<[[f64; 2]; 3]> = (0..hs.tris.len()).map(|i| hair::tri_uv(&model, &hs, i)).collect();
+        let lo = hair::to_stock_layout(&hs, &stock_uv, &suv, &rgba, size, &occ, &mut srgba, size, num(args, "--uv-pad", 6.0)?, num(args, "--uv-cross", 0.12)?, num(args, "--uv-seam", 24.0)?);
+        let spng = {
+            let mut b = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut b).write_image(&srgba, size as u32, size as u32, image::ExtendedColorType::Rgba8).map_err(|e| e.to_string())?;
+            b
+        };
+        let sdir = out.join("stock-uv");
+        std::fs::create_dir_all(sdir.join("textures")).map_err(|e| e.to_string())?;
+        std::fs::write(sdir.join("textures").join(format!("{sheet_name}.png")), &spng).map_err(|e| e.to_string())?;
+        let sw = wb_core::swap::swap(ri.model, sheet_name, &spng)?;
+        let sp = sdir.join(&ri.name);
+        std::fs::write(&sp, &sw.bytes).map_err(|e| e.to_string())?;
+        say(format!(
+            "stock UVs: {} hair texels and {} gutter texels repainted at {size} px ({} mirrored: the +x side is painted, the other side shows it mirrored; {} shared with another part, left as stock; {} blended where cards cross; {} texels blended across {} shared layout edges); wrote {}",
+            lo.inside, lo.gutter, lo.mirrored, lo.shared_other, lo.crossed, lo.seam_texels, lo.seams, sp.display()
+        ));
+        stock_uv_model = Some(Model::from_bytes(&sw.bytes)?);
+    }
+
     // 6: checks.
     let new_tex = Texture::new(size, size, rgba.clone());
     let mip_level = 3usize;
@@ -1008,6 +1089,10 @@ fn run(args: &Args, ri: &RunIn) -> Result<RunOut, String> {
         rows.push((c.0.clone(), &c.1, &extra_tex[k]));
     }
     rows.push((ri.label.into(), &new_model, &new_textures));
+    let stock_uv_tex: Vec<Option<Texture>> = stock_uv_model.as_ref().map(image_textures).unwrap_or_default();
+    if let Some(m) = &stock_uv_model {
+        rows.push(("stock UVs (texture only)".into(), m, &stock_uv_tex));
+    }
     let (blo, bhi) = render::bounds(model);
     let model_h = (bhi[1] - blo[1]) as f32;
     // Game distance: the whole character about 300 px tall (a 1080p field view), shown 3x.

@@ -540,6 +540,10 @@ pub fn neighbors(hs: &HairSet) -> Vec<Vec<(usize, (usize, usize))>> {
             nb[u[1]].push((u[0], *e));
         }
     }
+    // HashMap order changes every run; callers that take the first match need a fixed order.
+    for l in &mut nb {
+        l.sort_unstable();
+    }
     nb
 }
 
@@ -893,7 +897,15 @@ pub fn solve_gradient_aniso(pos: &[V3], tris: &[[usize; 3]], target: &[V3], alon
         *rows[v].entry(v).or_insert(0.0) += w;
         b[v] += w * prior[v];
     }
-    let rows: Vec<Vec<(usize, f64)>> = rows.into_iter().map(|r| r.into_iter().collect()).collect();
+    // Sorted so the sums run in the same order every run.
+    let rows: Vec<Vec<(usize, f64)>> = rows
+        .into_iter()
+        .map(|r| {
+            let mut v: Vec<(usize, f64)> = r.into_iter().collect();
+            v.sort_unstable_by_key(|e| e.0);
+            v
+        })
+        .collect();
     let mulv = |x: &[f64], out: &mut [f64]| {
         for (i, r) in rows.iter().enumerate() {
             out[i] = r.iter().map(|&(j, a)| a * x[j]).sum();
@@ -1945,6 +1957,27 @@ pub fn bary2(p: [[f64; 2]; 3], c: [f64; 2]) -> Option<[f64; 3]> {
     let l0 = ((p[1][1] - p[2][1]) * (c[0] - p[2][0]) + (p[2][0] - p[1][0]) * (c[1] - p[2][1])) / den;
     let l1 = ((p[2][1] - p[0][1]) * (c[0] - p[2][0]) + (p[0][0] - p[2][0]) * (c[1] - p[2][1])) / den;
     Some([l0, l1, 1.0 - l0 - l1])
+}
+
+/// Distance from `q` to the segment `a`-`b`.
+pub fn seg_dist3(q: V3, a: V3, b: V3) -> f64 {
+    let ab = sub(b, a);
+    let l2 = dot(ab, ab);
+    let t = if l2 > 0.0 { (dot(sub(q, a), ab) / l2).clamp(0.0, 1.0) } else { 0.0 };
+    len(sub(q, add(a, mul(ab, t))))
+}
+
+/// Barycentric coordinates of `q` (taken to lie in the plane) in the 3D triangle `p`.
+pub fn bary3(p: [V3; 3], q: V3) -> Option<[f64; 3]> {
+    let (e0, e1, e2) = (sub(p[1], p[0]), sub(p[2], p[0]), sub(q, p[0]));
+    let (d00, d01, d11, d20, d21) = (dot(e0, e0), dot(e0, e1), dot(e1, e1), dot(e2, e0), dot(e2, e1));
+    let den = d00 * d11 - d01 * d01;
+    if den.abs() < 1e-18 {
+        return None;
+    }
+    let v = (d11 * d20 - d01 * d21) / den;
+    let w = (d00 * d21 - d01 * d20) / den;
+    Some([1.0 - v - w, v, w])
 }
 
 /// Squared-distance transform along one line (Felzenszwalb and Huttenlocher).
@@ -3441,4 +3474,298 @@ pub fn alpha_coverage(tex: &crate::Texture, mask: &[bool], levels: usize) -> Vec
         out.push(if tot > 0.0 { cov / tot } else { 0.0 });
     }
     out
+}
+
+/// What `to_stock_layout` wrote.
+#[derive(Debug, Default, Clone)]
+pub struct LayoutOut {
+    /// Texels inside a hair triangle of the input layout.
+    pub inside: usize,
+    /// Texels within `pad` of one (gutter), extrapolated from the nearest triangle.
+    pub gutter: usize,
+    /// Inside texels that two places use, one on each side of x = 0 (a mirrored layout). The +x
+    /// side is painted; the other side shows its mirror image.
+    pub mirrored: usize,
+    /// Hair texels left alone because another part uses them too.
+    pub shared_other: usize,
+    /// Inside texels blended with a card that passes through theirs (`cross_r`).
+    pub crossed: usize,
+    /// Layout edges shared by two hair triangles, and texels blended across them (`seam_w`).
+    pub seams: usize,
+    pub seam_texels: usize,
+}
+
+/// Moves a hair bake into the input's own UV layout, so the hair can ship as a texture alone (stock
+/// mesh, stock UVs, a larger sheet). `stock_uv` and `tool_uv` are per hair-set triangle in 0..1;
+/// `tool` is the baked sheet (`tool_size` square) whose texels `tool_uv` addresses. Every texel of
+/// `out` (`size` square, already holding the stock sheet scaled up) that lies inside or within
+/// `pad` texels of a hair triangle, and is not in `occ`, takes the bake sampled at the same surface
+/// point. Duplicate faces sample through their primary. Where the layout reuses texels for two
+/// places, the place with the larger x wins, so the layout's own mirror decides the other side.
+///
+/// `cross_r` > 0 (model units) blends cards that pass through each other: a texel whose surface
+/// point lies within `cross_r` of another card's plane, over that card, takes a share of that
+/// card's paint at the same point, fading to none at `cross_r` from the plane. The share is all of
+/// it at this card's own outline, none at the other card's outline and half well inside both, so
+/// two cards that cross or lie flush show the same colour where they meet and neither outline
+/// reads as a cut. Alpha stays the texel's own.
+#[allow(clippy::too_many_arguments)]
+pub fn to_stock_layout(hs: &HairSet, stock_uv: &[[[f64; 2]; 3]], tool_uv: &[[[f64; 2]; 3]], tool: &[u8], tool_size: usize, occ: &[bool], out: &mut [u8], size: usize, pad: f64, cross_r: f64, seam_w: f64) -> LayoutOut {
+    let n = hs.tris.len();
+    // Cards that pass through each other: per primary, the other primaries (no shared edge; one
+    // shared corner is allowed, as cards that fan out from one point overlap near it)
+    // whose box comes within `cross_r` of its own.
+    let partners: Vec<Vec<usize>> = if cross_r > 0.0 {
+        let bb: Vec<(V3, V3)> = (0..n)
+            .map(|i| {
+                let c = hs.corners(i);
+                (std::array::from_fn(|k| c.iter().map(|p| p[k]).fold(f64::MAX, f64::min) - cross_r), std::array::from_fn(|k| c.iter().map(|p| p[k]).fold(f64::MIN, f64::max) + cross_r))
+            })
+            .collect();
+        (0..n)
+            .map(|i| {
+                if !hs.is_primary(i) {
+                    return Vec::new();
+                }
+                (0..n)
+                    .filter(|&j| j != i && hs.is_primary(j) && hs.wt[j].iter().filter(|w| hs.wt[i].contains(w)).count() < 2 && (0..3).all(|k| bb[i].0[k] <= bb[j].1[k] && bb[j].0[k] <= bb[i].1[k]))
+                    .collect()
+            })
+            .collect()
+    } else {
+        vec![Vec::new(); n]
+    };
+    // Open edges (used by one primary triangle only): the card outlines.
+    let open: Vec<Vec<(V3, V3)>> = if cross_r > 0.0 {
+        let mut uses: HashMap<(usize, usize), usize> = HashMap::new();
+        for i in (0..n).filter(|&i| hs.is_primary(i)) {
+            for c in 0..3 {
+                let (a, b) = (hs.wt[i][c], hs.wt[i][(c + 1) % 3]);
+                *uses.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        (0..n)
+            .map(|i| {
+                (0..3)
+                    .filter(|&c| {
+                        let (a, b) = (hs.wt[i][c], hs.wt[i][(c + 1) % 3]);
+                        uses.get(&(a.min(b), a.max(b))).copied().unwrap_or(0) <= 1
+                    })
+                    .map(|c| (hs.wpos[hs.wt[i][c]], hs.wpos[hs.wt[i][(c + 1) % 3]]))
+                    .collect()
+            })
+            .collect()
+    } else {
+        vec![Vec::new(); n]
+    };
+    // How far inside its card a point is, as a 0..1 fade over `cross_r` from the outline.
+    let inside_card = |t: usize, q: V3| -> f64 {
+        let d = open[t].iter().map(|&(a, b)| seg_dist3(q, a, b)).fold(f64::MAX, f64::min);
+        (d / cross_r).min(1.0)
+    };
+    // Per texel: (distance, priority, triangle, other side seen).
+    let mut best: Vec<(f64, f64, usize, bool)> = vec![(f64::MAX, f64::MIN, usize::MAX, false); size * size];
+    let sz = size as f64;
+    for i in 0..n {
+        let p: [[f64; 2]; 3] = std::array::from_fn(|k| [stock_uv[i][k][0] * sz, stock_uv[i][k][1] * sz]);
+        let cx = hs.centroid(i)[0];
+        let pri = if hs.is_primary(i) { 1e3 } else { 0.0 } + cx;
+        let x0 = (p.iter().map(|a| a[0]).fold(f64::MAX, f64::min) - pad).floor().max(0.0) as usize;
+        let x1 = ((p.iter().map(|a| a[0]).fold(f64::MIN, f64::max) + pad).ceil().max(0.0) as usize).min(size - 1);
+        let y0 = (p.iter().map(|a| a[1]).fold(f64::MAX, f64::min) - pad).floor().max(0.0) as usize;
+        let y1 = ((p.iter().map(|a| a[1]).fold(f64::MIN, f64::max) + pad).ceil().max(0.0) as usize).min(size - 1);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let d = point_tri_dist([x as f64 + 0.5, y as f64 + 0.5], p);
+                if d > pad {
+                    continue;
+                }
+                let b = &mut best[y * size + x];
+                if d == 0.0 && b.0 == 0.0 && b.2 != usize::MAX && (hs.centroid(b.2)[0] > 0.02) != (cx > 0.02) {
+                    b.3 = true;
+                }
+                if d < b.0 - 1e-9 || (d <= b.0 + 1e-9 && pri > b.1) {
+                    let seen = b.3;
+                    *b = (d, pri, i, seen);
+                }
+            }
+        }
+    }
+    let ts = tool_size as f64;
+    let sample = |u: f64, v: f64| -> [f64; 4] {
+        let x = (u * ts - 0.5).clamp(0.0, ts - 1.0);
+        let y = (v * ts - 0.5).clamp(0.0, ts - 1.0);
+        let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+        let (x1, y1) = ((x0 + 1).min(tool_size - 1), (y0 + 1).min(tool_size - 1));
+        let (fx, fy) = (x - x0 as f64, y - y0 as f64);
+        let px = |xx: usize, yy: usize, c: usize| tool[(yy * tool_size + xx) * 4 + c] as f64;
+        std::array::from_fn(|c| (px(x0, y0, c) * (1.0 - fx) + px(x1, y0, c) * fx) * (1.0 - fy) + (px(x0, y1, c) * (1.0 - fx) + px(x1, y1, c) * fx) * fy)
+    };
+    let mut r = LayoutOut::default();
+    for y in 0..size {
+        for x in 0..size {
+            let k = y * size + x;
+            let (d, _, i, seen) = best[k];
+            if i == usize::MAX {
+                continue;
+            }
+            if occ[k] {
+                if d == 0.0 {
+                    r.shared_other += 1;
+                }
+                continue;
+            }
+            let p: [[f64; 2]; 3] = std::array::from_fn(|c| [stock_uv[i][c][0] * sz, stock_uv[i][c][1] * sz]);
+            let Some(bc) = bary2(p, [x as f64 + 0.5, y as f64 + 0.5]) else { continue };
+            // The primary's tool UVs, in this triangle's corner order.
+            let pi = hs.primary[i];
+            let tuv: [[f64; 2]; 3] = std::array::from_fn(|c| {
+                let kk = hs.wt[pi].iter().position(|&w| w == hs.wt[i][c]).unwrap_or(c);
+                tool_uv[pi][kk]
+            });
+            let u = (0..3).map(|c| bc[c] * tuv[c][0]).sum::<f64>();
+            let v = (0..3).map(|c| bc[c] * tuv[c][1]).sum::<f64>();
+            let mut s = sample(u, v);
+            if d == 0.0 && !partners[pi].is_empty() {
+                let cr = hs.corners(i);
+                let q: V3 = std::array::from_fn(|k| (0..3).map(|c| bc[c] * cr[c][k]).sum::<f64>());
+                let (mut acc, mut wsum) = ([0.0f64; 3], 0.0f64);
+                for &j in &partners[pi] {
+                    let cj = hs.corners(j);
+                    let nj = hs.normal(j);
+                    let dist = dot(sub(q, cj[0]), nj);
+                    if dist.abs() >= cross_r {
+                        continue;
+                    }
+                    let Some(bj) = bary3(cj, sub(q, mul(nj, dist))) else { continue };
+                    if bj.iter().any(|&b| b < -0.02) {
+                        continue;
+                    }
+                    let t = 1.0 - dist.abs() / cross_r;
+                    // At this card's own outline take the other card fully, at the other card's
+                    // outline not at all, half in between: both cards then agree over the overlap
+                    // and neither outline shows.
+                    let qj = sub(q, mul(nj, dist));
+                    let (ei, ej) = (inside_card(pi, q), inside_card(j, qj));
+                    let share = if ei + ej > 0.0 { ej / (ei + ej) } else { 0.5 };
+                    let w = share * t * t * (3.0 - 2.0 * t);
+                    let sj = sample((0..3).map(|c| bj[c] * tool_uv[j][c][0]).sum::<f64>(), (0..3).map(|c| bj[c] * tool_uv[j][c][1]).sum::<f64>());
+                    if sj[3] < 128.0 {
+                        continue;
+                    }
+                    for c in 0..3 {
+                        acc[c] += w * sj[c];
+                    }
+                    wsum += w;
+                }
+                if wsum > 0.0 {
+                    // Several crossings at one point: the others' paint averaged, at most all of it.
+                    let take = wsum.min(1.0);
+                    for c in 0..3 {
+                        s[c] = s[c] * (1.0 - take) + acc[c] / wsum * take;
+                    }
+                    r.crossed += 1;
+                }
+            }
+            for c in 0..4 {
+                out[k * 4 + c] = s[c].round().clamp(0.0, 255.0) as u8;
+            }
+            if d == 0.0 {
+                r.inside += 1;
+                if seen {
+                    r.mirrored += 1;
+                }
+            } else {
+                r.gutter += 1;
+            }
+        }
+    }
+    if seam_w > 0.0 {
+        seam_blend(hs, stock_uv, &best.iter().map(|b| b.2 != usize::MAX).collect::<Vec<_>>(), occ, out, size, seam_w, &mut r);
+    }
+    r
+}
+
+/// Blends across every edge that two hair triangles share in the stock UV layout, over `w` texels
+/// either side: a texel takes part of the texel mirrored across the edge (half at the edge, none
+/// at `w`), so the paint runs on across the edge as the stock paint does. The bake paints each
+/// triangle from its own surface point, so where the layout joins two triangles that the model
+/// folds apart (a card folded back over itself), the two sides can differ and the texture filter
+/// then draws a line along the fold.
+#[allow(clippy::too_many_arguments)]
+fn seam_blend(hs: &HairSet, stock_uv: &[[[f64; 2]; 3]], hair: &[bool], occ: &[bool], out: &mut [u8], size: usize, w: f64, r: &mut LayoutOut) {
+    let sz = size as f64;
+    let q = |p: [f64; 2]| ((p[0] * sz * 4.0).round() as i64, (p[1] * sz * 4.0).round() as i64);
+    // UV edge -> (triangle, the corner not on the edge).
+    let mut edges: HashMap<((i64, i64), (i64, i64)), Vec<(usize, usize)>> = HashMap::new();
+    for i in (0..hs.tris.len()).filter(|&i| hs.is_primary(i)) {
+        for c in 0..3 {
+            let (a, b) = (q(stock_uv[i][c]), q(stock_uv[i][(c + 1) % 3]));
+            if a != b {
+                edges.entry((a.min(b), a.max(b))).or_default().push((i, (c + 2) % 3));
+            }
+        }
+    }
+    let src = out.to_vec();
+    let px = |x: f64, y: f64, c: usize| -> f64 {
+        let x = (x - 0.5).clamp(0.0, sz - 1.0);
+        let y = (y - 0.5).clamp(0.0, sz - 1.0);
+        let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+        let (x1, y1) = ((x0 + 1).min(size - 1), (y0 + 1).min(size - 1));
+        let (fx, fy) = (x - x0 as f64, y - y0 as f64);
+        let g = |xx: usize, yy: usize| src[(yy * size + xx) * 4 + c] as f64;
+        (g(x0, y0) * (1.0 - fx) + g(x1, y0) * fx) * (1.0 - fy) + (g(x0, y1) * (1.0 - fx) + g(x1, y1) * fx) * fy
+    };
+    let mut done = vec![false; size * size];
+    // Sorted, so the first edge to claim a texel is the same every run.
+    let mut edges: Vec<_> = edges.into_iter().collect();
+    edges.sort_unstable();
+    for &((a, b), ref tris) in &edges {
+        // Two triangles on opposite sides of the edge (mirror copies and stacked charts share all
+        // three corners or lie on one side; they are skipped).
+        let p0 = [a.0 as f64 / 4.0, a.1 as f64 / 4.0];
+        let p1 = [b.0 as f64 / 4.0, b.1 as f64 / 4.0];
+        let d = [p1[0] - p0[0], p1[1] - p0[1]];
+        let l = (d[0] * d[0] + d[1] * d[1]).sqrt();
+        let n = [-d[1] / l, d[0] / l];
+        let side = |&(t, c): &(usize, usize)| {
+            let o = [stock_uv[t][c][0] * sz - p0[0], stock_uv[t][c][1] * sz - p0[1]];
+            o[0] * n[0] + o[1] * n[1]
+        };
+        let pos = tris.iter().any(|t| side(t) > 0.5);
+        let neg = tris.iter().any(|t| side(t) < -0.5);
+        if !(pos && neg) {
+            continue;
+        }
+        r.seams += 1;
+        let x0 = (p0[0].min(p1[0]) - w).floor().max(0.0) as usize;
+        let x1 = ((p0[0].max(p1[0]) + w).ceil() as usize).min(size - 1);
+        let y0 = (p0[1].min(p1[1]) - w).floor().max(0.0) as usize;
+        let y1 = ((p0[1].max(p1[1]) + w).ceil() as usize).min(size - 1);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let k = y * size + x;
+                if !hair[k] || occ[k] || done[k] {
+                    continue;
+                }
+                let o = [x as f64 + 0.5 - p0[0], y as f64 + 0.5 - p0[1]];
+                let t = (o[0] * d[0] + o[1] * d[1]) / (l * l);
+                let s = o[0] * n[0] + o[1] * n[1];
+                if !(0.0..=1.0).contains(&t) || s.abs() >= w {
+                    continue;
+                }
+                let (mx, my) = (x as f64 + 0.5 - 2.0 * s * n[0], y as f64 + 0.5 - 2.0 * s * n[1]);
+                let mk = (my.floor().clamp(0.0, sz - 1.0) as usize) * size + mx.floor().clamp(0.0, sz - 1.0) as usize;
+                if !hair[mk] || occ[mk] {
+                    continue;
+                }
+                let f = 0.5 * (1.0 - s.abs() / w);
+                for c in 0..3 {
+                    out[k * 4 + c] = (src[k * 4 + c] as f64 * (1.0 - f) + px(mx, my, c) * f).round().clamp(0.0, 255.0) as u8;
+                }
+                done[k] = true;
+                r.seam_texels += 1;
+            }
+        }
+    }
 }

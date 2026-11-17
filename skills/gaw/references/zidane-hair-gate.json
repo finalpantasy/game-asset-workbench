@@ -15,10 +15,16 @@
    "why": "straight cuts across the strand flow where cards meet"},
   {"id": "layer-direction-cut load at most 1.5x stock", "type": "ratio", "kinds": ["layer-direction-cut"], "measure": "load", "max_x": 1.5, "floor": 0.05,
    "why": "same, as a share of the card edges"},
+  {"id": "card-edge count at most 1.5x stock", "type": "ratio", "kinds": ["card-edge"], "measure": "count", "max_x": 1.5,
+   "why": "flush card edges with a colour step and strands running across them (the hard cuts the layer test misses)"},
   {"id": "lock-scale load at most 1.0x stock", "type": "ratio", "kinds": ["lock-scale"], "measure": "load", "max_x": 1.0, "floor": 0.05,
    "why": "fine wood-grain stripes where stock has broad locks"},
-  {"id": "no new cut, smear or flat box at marks 1 6 7 8 9", "type": "marks", "kinds": ["direction-break", "layer-direction-cut", "smear-blur", "flat-patch"], "marks": [1, 6, 7, 8, 9], "allow": "reference",
+  {"id": "no new cut, smear or flat box at marks 1 4 6 7 8 9", "type": "marks", "kinds": ["direction-break", "layer-direction-cut", "smear-blur", "flat-patch"], "marks": [1, 4, 6, 7, 8, 9], "allow": "reference",
    "why": "the user's marks: a hit means more boxes of these kinds than stock has in the same circle"},
+  {"id": "no new card-edge box at marks 4 7 8 (circles widened 30 px)", "type": "marks", "kinds": ["card-edge"], "marks": [4, 7, 8], "allow": "reference", "slack": 30,
+   "why": "the hard cuts the user marked: the circles sit up to about 27 px beside the cut, so they are widened"},
+  {"id": "no new card-edge box at marks 2 3 6", "type": "marks", "kinds": ["card-edge"], "marks": [2, 3, 6], "allow": "reference",
+   "why": "places the user marked that are not cuts; a box here would be a false alarm"},
   {"id": "no new speck box at marks 2 3 4 5 8", "type": "marks", "kinds": ["speck"], "marks": [2, 3, 4, 5, 8], "allow": "reference",
    "why": "dots, dither and cut-off shards at the user's marks"}
  ]

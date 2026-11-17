@@ -105,11 +105,16 @@ pub struct Opts {
     pub min_coherence: f64,
     /// An angle above this counts as bad (degrees).
     pub bad_deg: f64,
+    /// Double-sided cards (a front triangle and a reversed back copy on the same three corners):
+    /// never pair a triangle with its own back copy (the unfold mirrors the strand axis and reads
+    /// as twice the real angle), and on an edge shared by two double-sided cards pair front with
+    /// front and back with back. Off by default so older numbers stay comparable.
+    pub twin_aware: bool,
 }
 
 impl Default for Opts {
     fn default() -> Opts {
-        Opts { per_edge: 6, min_coherence: 0.25, bad_deg: 30.0 }
+        Opts { per_edge: 6, min_coherence: 0.25, bad_deg: 30.0, twin_aware: false }
     }
 }
 
@@ -398,10 +403,35 @@ pub fn check_with(pieces: &[Piece], o: &Opts, expected: &dyn Fn(usize, usize) ->
     keys.sort();
     for k in keys {
         let v = &edges[k];
-        if v.len() != 2 || v[0].0 == v[1].0 {
-            continue;
+        let twin = |x: usize, y: usize| {
+            let (mut kx, mut ky) = (tris[x].key, tris[y].key);
+            kx.sort();
+            ky.sort();
+            kx == ky
+        };
+        // The pairs of (triangle, edge slot) to compare across this edge.
+        let mut todo: Vec<((usize, usize), (usize, usize))> = Vec::new();
+        if v.len() == 2 {
+            if v[0].0 != v[1].0 && !(o.twin_aware && twin(v[0].0, v[1].0)) {
+                todo.push((v[0], v[1]));
+            }
+        } else if o.twin_aware && v.len() == 4 {
+            // Two double-sided cards on one edge: walk the edge in opposite directions on the
+            // neighbours that face the same way, so match each triangle with such a one.
+            let fwd = |&(t, e): &(usize, usize)| tris[t].key[e] == k.0;
+            let mut used = [false; 4];
+            for i in 0..4 {
+                if used[i] {
+                    continue;
+                }
+                if let Some(j) = (i + 1..4).find(|&j| !used[j] && v[j].0 != v[i].0 && !twin(v[i].0, v[j].0) && fwd(&v[i]) != fwd(&v[j])) {
+                    used[i] = true;
+                    used[j] = true;
+                    todo.push((v[i], v[j]));
+                }
+            }
         }
-        let ((a, ai), (b, _)) = (v[0], v[1]);
+        for ((a, ai), (b, _)) in todo {
         let (ta, tb) = (&tris[a], &tris[b]);
         let same_tex = std::ptr::eq(pieces[ta.piece].rgba.as_ptr(), pieces[tb.piece].rgba.as_ptr());
         let (w, h) = (pieces[ta.piece].w as f64, pieces[ta.piece].h as f64);
@@ -421,6 +451,7 @@ pub fn check_with(pieces: &[Piece], o: &Opts, expected: &dyn Fn(usize, usize) ->
             }
         }
         pairs.push(Pair { a, ai, b, seam });
+        }
     }
     // Charts: triangles joined by UV-continuous edges.
     let mut uf: Vec<usize> = (0..tris.len()).collect();

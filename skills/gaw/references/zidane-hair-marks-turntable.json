@@ -1,0 +1,15 @@
+{
+ "about": "The nine marks from experiments/zidane-hair-tool-v3/close-look-coordinator.png in the pixels of the gaw hair close-up turntable panels (480 px, front/left/back/right), with the crop boxes the hair session uses for its stock/v3/v4 pairs. x, y is the centre, r the radius of the coordinator's circle; box is the crop.",
+ "camera": "turntable",
+ "marks": [
+  {"id": 1, "name": "widow's peak (flat wedge)", "view": "front", "x": 240, "y": 135, "r": 58, "box": [170, 65, 310, 205]},
+  {"id": 2, "name": "specks by cheek", "view": "front", "x": 365, "y": 270, "r": 28, "box": [300, 205, 430, 335]},
+  {"id": 3, "name": "shards at tips", "view": "front", "x": 120, "y": 250, "r": 34, "box": [55, 185, 185, 315]},
+  {"id": 4, "name": "shards over ear", "view": "left", "x": 216, "y": 215, "r": 44, "box": [150, 150, 280, 280]},
+  {"id": 5, "name": "holes over cheek (stipple)", "view": "left", "x": 156, "y": 305, "r": 40, "box": [90, 240, 220, 370]},
+  {"id": 6, "name": "blur, back", "view": "back", "x": 240, "y": 215, "r": 88, "box": [150, 125, 330, 305]},
+  {"id": 7, "name": "direction cut", "view": "right", "x": 176, "y": 235, "r": 48, "box": [110, 170, 240, 300]},
+  {"id": 8, "name": "specks by ear", "view": "right", "x": 336, "y": 285, "r": 34, "box": [276, 225, 396, 345]},
+  {"id": 9, "name": "smear, upper side", "view": "left", "x": 256, "y": 125, "r": 58, "box": [190, 60, 320, 190]}
+ ]
+}

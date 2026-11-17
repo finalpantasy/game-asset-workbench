@@ -31,6 +31,12 @@ pub mod strands;
 pub mod defects;
 pub mod hairlook;
 pub mod fbx;
+pub mod bvh;
+pub mod weights;
+pub mod deform;
+pub mod adopt;
+pub mod repair;
+pub mod blink;
 
 pub use model::Model;
 

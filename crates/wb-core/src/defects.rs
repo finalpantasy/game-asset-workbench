@@ -40,6 +40,17 @@ pub const FLAT_RATIO: f64 = 8.0;
 pub const LAYER_DE: f64 = 14.0;
 /// A hard cut must run this many connected pixels.
 pub const LAYER_RUN_PX: usize = 24;
+/// Card edge: colour step (Lab) across an edge where two cards meet flush (small depth gap).
+pub const EDGE_DE: f64 = 6.0;
+/// `gaw defects --cut-regions skip`: two UV islands whose mean colours differ by this many Lab
+/// units are different materials, and the colour step between them is not a layer cut.
+pub const CUT_REGION_DE: f64 = 20.0;
+/// A card edge must run this many pixels, bridging gaps of up to two pixels.
+pub const EDGE_RUN_PX: usize = 30;
+/// Flush means the two triangles' planes are this close at the edge, as a share of the model's size.
+pub const EDGE_GAP_FRAC: f32 = 0.002;
+/// A card edge counts when its direction crosses the strand flow by at least this (degrees).
+pub const EDGE_CROSS_DEG: f64 = 30.0;
 /// A one- or two-pixel dot must differ from its surroundings by this much (Lab).
 pub const DOT_DE: f32 = 16.0;
 /// Dots a 16 x 16 render tile needs before it counts.
@@ -70,10 +81,11 @@ pub enum Kind {
     Stipple,
     LayerCut,
     Grain,
+    CardEdge,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 11] = [Kind::Jagged, Kind::Discolor, Kind::Stripe, Kind::Direction, Kind::Gutter, Kind::Blur, Kind::Flat, Kind::Speck, Kind::Stipple, Kind::LayerCut, Kind::Grain];
+    pub const ALL: [Kind; 12] = [Kind::Jagged, Kind::Discolor, Kind::Stripe, Kind::Direction, Kind::Gutter, Kind::Blur, Kind::Flat, Kind::Speck, Kind::Stipple, Kind::LayerCut, Kind::Grain, Kind::CardEdge];
     pub fn tag(self) -> &'static str {
         match self {
             Kind::Jagged => "jagged-edge",
@@ -87,6 +99,7 @@ impl Kind {
             Kind::Stipple => "alpha-stipple",
             Kind::LayerCut => "layer-direction-cut",
             Kind::Grain => "lock-scale",
+            Kind::CardEdge => "card-edge",
         }
     }
     /// What `Defect::raw` measures.
@@ -103,6 +116,7 @@ impl Kind {
             Kind::Stipple => "share of covered texels in tiny alpha holes or scraps",
             Kind::LayerCut => "Lab step across a hard cut between two triangles",
             Kind::Grain => "times more fibre-scale energy share than the reference",
+            Kind::CardEdge => "Lab step across an edge where two cards meet flush",
         }
     }
     pub fn limit(self) -> f64 {
@@ -118,6 +132,7 @@ impl Kind {
             Kind::Stipple => STIPPLE_FRAC,
             Kind::LayerCut => LAYER_DE,
             Kind::Grain => LOCK_RATIO,
+            Kind::CardEdge => EDGE_DE,
         }
     }
 }
@@ -591,7 +606,7 @@ pub fn directions(model: &Model, tex: &[Option<Texture>], keep: &Keep, topo: &To
     if pieces.is_empty() {
         return out;
     }
-    let r = strands::check(&pieces, &strands::Opts::default());
+    let r = strands::check(&pieces, &strands::Opts { twin_aware: true, ..strands::Opts::default() });
     let seam_w: f64 = r.edges.iter().filter(|e| e.kind == strands::Kind::Seam).map(|e| e.weight as f64).sum();
     let mut flagged: Vec<&strands::EdgeScore> = Vec::new();
     let mut bad_w = 0.0f64;
@@ -1613,17 +1628,111 @@ pub struct LayerOut {
     pub defects: Vec<Defect>,
     pub boundary_px: usize,
     pub flagged_px: usize,
+    /// Boundary pixels over the colour limit that sit on a welded edge (both triangles share the
+    /// edge and its UVs run on): the texture is continuous there, so it is paint, not a cut.
+    pub welded_px: usize,
+    /// Boundary pixels over the colour limit between two islands of different material (see
+    /// `CutRegions`), skipped when regions are given.
+    pub region_px: usize,
+}
+
+/// True when two triangles of one mesh share an edge (two corners at the same position) and the
+/// UVs of both shared corners agree within 0.75 texel: the paint is continuous across it.
+fn welded_pair(model: &Model, tex: &[Option<Texture>], ga: usize, gb: usize, eps: f32) -> bool {
+    let (ma, ta) = render::split_id(model, ga);
+    let (mb, tb) = render::split_id(model, gb);
+    if ma != mb {
+        return false;
+    }
+    let m = &model.meshes[ma];
+    let (Some(t), Some(ca), Some(cb)) = (mesh_tex(model, tex, ma), m.tris.get(ta), m.tris.get(tb)) else { return false };
+    let mut shared = 0;
+    for &va in ca {
+        for &vb in cb {
+            let (p, q) = (m.pos[va as usize], m.pos[vb as usize]);
+            if (0..3).all(|k| (p[k] - q[k]).abs() <= eps) {
+                shared += 1;
+                let (ua, ub) = (m.uv[va as usize], m.uv[vb as usize]);
+                if ((ua[0] - ub[0]) * t.w as f32).hypot((ua[1] - ub[1]) * t.h as f32) > 0.75 {
+                    return false;
+                }
+            }
+        }
+    }
+    shared >= 2
+}
+
+/// Depth of triangle `g`'s plane at pixel (x, y) (the plane extended past the triangle).
+fn tri_depth_at(model: &Model, sc: &ShotCtx, g: i32, x: usize, y: usize) -> Option<f32> {
+    let (mi, ti) = render::split_id(model, g as usize);
+    let m = model.meshes.get(mi)?;
+    let t = m.tris.get(ti)?;
+    let pr: [[f32; 3]; 3] = std::array::from_fn(|k| sc.cam.project(sc.px, sc.px, sc.pose[mi][t[k] as usize]));
+    let (a, b, c) = (pr[0], pr[1], pr[2]);
+    let area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    if area.abs() < 1e-9 {
+        return None;
+    }
+    let (sx, sy) = (x as f32 + 0.5, y as f32 + 0.5);
+    let w0 = ((b[0] - sx) * (c[1] - sy) - (b[1] - sy) * (c[0] - sx)) / area;
+    let w1 = ((c[0] - sx) * (a[1] - sy) - (c[1] - sy) * (a[0] - sx)) / area;
+    Some(w0 * a[2] + w1 * b[2] + (1.0 - w0 - w1) * c[2])
+}
+
+/// UV islands with their mean colour, for telling a change of material (skin to cloth, glove to
+/// sleeve: the two islands' colours differ by `min_de` Lab or more) from a cut inside one material.
+pub struct CutRegions {
+    /// Island id per mesh, per triangle (as `Topo::island`).
+    pub island: Vec<Vec<u32>>,
+    /// Mean Lab colour per island (texture sampled at four points of every triangle, opaque only).
+    pub mean: HashMap<u32, [f32; 3]>,
+    pub min_de: f32,
+}
+
+pub fn cut_regions(model: &Model, tex: &[Option<Texture>], min_de: f32) -> CutRegions {
+    let topo = topo(model);
+    let mut acc: HashMap<u32, ([f64; 3], f64)> = HashMap::new();
+    for (mi, m) in model.meshes.iter().enumerate() {
+        let Some(t) = mesh_tex(model, tex, mi) else { continue };
+        for (ti, tri) in m.tris.iter().enumerate() {
+            let uv: [[f32; 2]; 3] = std::array::from_fn(|k| m.uv[tri[k] as usize]);
+            for w in [[1.0f32 / 3.0, 1.0 / 3.0, 1.0 / 3.0], [0.6, 0.2, 0.2], [0.2, 0.6, 0.2], [0.2, 0.2, 0.6]] {
+                let (u, v) = (w[0] * uv[0][0] + w[1] * uv[1][0] + w[2] * uv[2][0], w[0] * uv[0][1] + w[1] * uv[1][1] + w[2] * uv[2][1]);
+                let c = bilinear(t, u, v);
+                if c[3] < 128.0 {
+                    continue;
+                }
+                let l = lab([c[0], c[1], c[2]]);
+                let e = acc.entry(topo.island[mi][ti]).or_insert(([0.0; 3], 0.0));
+                for k in 0..3 {
+                    e.0[k] += l[k] as f64;
+                }
+                e.1 += 1.0;
+            }
+        }
+    }
+    let mean = acc.into_iter().map(|(k, (s, n))| (k, [(s[0] / n) as f32, (s[1] / n) as f32, (s[2] / n) as f32])).collect();
+    CutRegions { island: topo.island, mean, min_de }
 }
 
 /// Hard cuts between two triangles of the part: a run of pixels where the triangle changes and the
 /// colour two pixels either side differs by more than `LAYER_DE`. That is where one layer ends and
 /// the next starts with different strands, tone or direction.
 pub fn layer_edges(model: &Model, tex: &[Option<Texture>], sc: &ShotCtx, kg: &[bool]) -> LayerOut {
+    layer_edges_with(model, tex, sc, kg, None)
+}
+
+/// `layer_edges`, optionally skipping the boundaries between two UV islands whose mean colours
+/// differ by `regions.min_de` or more (a change of material, counted in `LayerOut::region_px`).
+pub fn layer_edges_with(model: &Model, tex: &[Option<Texture>], sc: &ShotCtx, kg: &[bool], regions: Option<&CutRegions>) -> LayerOut {
     let (w, h) = (sc.px, sc.px);
     let pick = &sc.shot.pick;
     let labs = lab_image(sc);
     let inpart = |g: i32| g >= 0 && kg.get(g as usize).copied().unwrap_or(false);
     let mut out = LayerOut::default();
+    let (blo, bhi) = render::bounds(model);
+    let eps = 1e-5 * (0..3).map(|k| (bhi[k] - blo[k]).powi(2)).sum::<f32>().sqrt().max(1e-6);
+    let mut weld_cache: HashMap<(i32, i32), bool> = HashMap::new();
     let mut step = vec![0.0f32; w * h];
     let mut hard = vec![false; w * h];
     for y in 3..h - 3 {
@@ -1648,6 +1757,29 @@ pub fn layer_edges(model: &Model, tex: &[Option<Texture>], sc: &ShotCtx, kg: &[b
                 let avg = |p: usize, q: usize| [0.5 * (labs[p][0] + labs[q][0]), 0.5 * (labs[p][1] + labs[q][1]), 0.5 * (labs[p][2] + labs[q][2])];
                 let d = de(avg(i - s, i - 2 * s), avg(j + s, j + 2 * s));
                 if d as f64 >= LAYER_DE {
+                    // A welded edge (the two triangles share it and the UVs run on across it) has
+                    // continuous paint: a step there is a strand boundary lying on the edge.
+                    if *weld_cache.entry((a.min(b), a.max(b))).or_insert_with(|| welded_pair(model, tex, a as usize, b as usize, eps)) {
+                        out.welded_px += 1;
+                        continue;
+                    }
+                    let (ma, ta) = render::split_id(model, a as usize);
+                    let (mb, tb) = render::split_id(model, b as usize);
+                    let isl = |m: usize, t: usize| regions.map(|r| r.island[m][t]);
+                    let reg_de = match (regions, isl(ma, ta), isl(mb, tb)) {
+                        (Some(r), Some(ia), Some(ib)) if ia != ib => match (r.mean.get(&ia), r.mean.get(&ib)) {
+                            (Some(p), Some(q)) => Some(de(*p, *q)),
+                            _ => None,
+                        },
+                        (Some(_), Some(ia), Some(ib)) if ia == ib => Some(0.0),
+                        _ => None,
+                    };
+                    if let (Some(r), Some(v)) = (regions, reg_de) {
+                        if v >= r.min_de {
+                            out.region_px += 1;
+                            continue;
+                        }
+                    }
                     out.flagged_px += 1;
                     for k in [i, j] {
                         hard[k] = true;
@@ -1694,6 +1826,170 @@ pub fn layer_edges(model: &Model, tex: &[Option<Texture>], sc: &ShotCtx, kg: &[b
         let mut d = Defect { kind: Kind::LayerCut, raw: mean, score: mean / LAYER_DE, note: String::new(), tris: Vec::new(), anchors: Vec::new(), boxes: Vec::new(), island: None, screen: Some(Screen { view: sc.name.clone(), px: sc.px, bbox: [x0 as i32 - 8, y0 as i32 - 8, x1 as i32 + 8, y1 as i32 + 8] }) };
         attach_pixels(&mut d, model, tex, sc, &mem);
         d.note = format!("hard cut {} px long between two triangles of the part: colour steps by {:.0} (Lab) across it, so one layer ends and the next starts with different tone or strands", mem.len(), mean);
+        out.defects.push(d);
+    }
+    out
+}
+
+/// Where two cards meet flush: a run of boundary pixels between two triangles of one part that are
+/// not welded (their UVs do not run on), whose planes meet within `EDGE_GAP_FRAC` of the model's
+/// size, with a colour step of `EDGE_DE` or more across it. Runs may be broken by slivers and welded
+/// stretches, so the pixels are joined across gaps of two pixels. Occlusion edges (one lock over
+/// another, a big depth gap) are not this kind.
+pub fn card_edges(model: &Model, tex: &[Option<Texture>], sc: &ShotCtx, kg: &[bool]) -> LayerOut {
+    let (w, h) = (sc.px, sc.px);
+    let pick = &sc.shot.pick;
+    let labs = lab_image(sc);
+    let inpart = |g: i32| g >= 0 && kg.get(g as usize).copied().unwrap_or(false);
+    let mut out = LayerOut::default();
+    let (blo, bhi) = render::bounds(model);
+    let diag = (0..3).map(|k| (bhi[k] - blo[k]).powi(2)).sum::<f32>().sqrt().max(1e-6);
+    let eps = 1e-5 * diag;
+    let edge_de = EDGE_DE;
+    let edge_run = EDGE_RUN_PX;
+    let gap_max = EDGE_GAP_FRAC * diag;
+    let mut cache: HashMap<(i32, i32), bool> = HashMap::new();
+    let mut step = vec![0.0f32; w * h];
+    let mut hard = vec![false; w * h];
+    for y in 3..h - 3 {
+        for x in 3..w - 3 {
+            let i = y * w + x;
+            let a = pick[i];
+            if !inpart(a) {
+                continue;
+            }
+            for (dx, dy) in [(1usize, 0usize), (0, 1)] {
+                let s = dy * w + dx;
+                let j = i + s;
+                let b = pick[j];
+                if b == a || !inpart(b) || !inpart(pick[i - s]) || !inpart(pick[i - 2 * s]) || !inpart(pick[j + s]) || !inpart(pick[j + 2 * s]) {
+                    continue;
+                }
+                if *cache.entry((a.min(b), a.max(b))).or_insert_with(|| welded_pair(model, tex, a as usize, b as usize, eps)) {
+                    continue;
+                }
+                let gap = match (tri_depth_at(model, sc, a, x, y), tri_depth_at(model, sc, b, x, y), tri_depth_at(model, sc, a, x + dx, y + dy), tri_depth_at(model, sc, b, x + dx, y + dy)) {
+                    (Some(za), Some(zb), Some(za2), Some(zb2)) => 0.5 * ((za - zb).abs() + (za2 - zb2).abs()),
+                    _ => f32::MAX,
+                };
+                if gap > gap_max {
+                    continue;
+                }
+                out.boundary_px += 1;
+                let avg = |p: usize, q: usize| [0.5 * (labs[p][0] + labs[q][0]), 0.5 * (labs[p][1] + labs[q][1]), 0.5 * (labs[p][2] + labs[q][2])];
+                let d = de(avg(i - s, i - 2 * s), avg(j + s, j + 2 * s));
+                if d as f64 >= edge_de {
+                    out.flagged_px += 1;
+                    for k in [i, j] {
+                        hard[k] = true;
+                        step[k] = step[k].max(d);
+                    }
+                }
+            }
+        }
+    }
+    // Join across gaps of up to two pixels: label on a mask grown by one pixel, count the real ones.
+    let mut grown = hard.clone();
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            if hard[y * w + x] {
+                for yy in y - 1..=y + 1 {
+                    for xx in x - 1..=x + 1 {
+                        grown[yy * w + xx] = true;
+                    }
+                }
+            }
+        }
+    }
+    let mut seen = vec![false; w * h];
+    for s0 in 0..w * h {
+        if !grown[s0] || seen[s0] {
+            continue;
+        }
+        let mut stack = vec![s0];
+        seen[s0] = true;
+        let mut mem = Vec::new();
+        while let Some(i) = stack.pop() {
+            if hard[i] {
+                mem.push(i);
+            }
+            let (x, y) = ((i % w) as i64, (i / w) as i64);
+            for (dx, dy) in DIRS8 {
+                let (xx, yy) = (x + dx as i64, y + dy as i64);
+                if xx < 0 || yy < 0 || xx as usize >= w || yy as usize >= h {
+                    continue;
+                }
+                let j = yy as usize * w + xx as usize;
+                if grown[j] && !seen[j] {
+                    seen[j] = true;
+                    stack.push(j);
+                }
+            }
+        }
+        if mem.len() < edge_run {
+            continue;
+        }
+        let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+        for &p in &mem {
+            x0 = x0.min(p % w);
+            y0 = y0.min(p / w);
+            x1 = x1.max(p % w);
+            y1 = y1.max(p / w);
+        }
+        // Direction of the run (principal axis of its pixels) against the strand flow around it
+        // (structure tensor of the interior pixels, at least two pixels from any card boundary).
+        let n = mem.len() as f64;
+        let (mx, my) = (mem.iter().map(|&p| (p % w) as f64).sum::<f64>() / n, mem.iter().map(|&p| (p / w) as f64).sum::<f64>() / n);
+        let (mut cxx, mut cyy, mut cxy) = (0.0f64, 0.0f64, 0.0f64);
+        for &p in &mem {
+            let (dx, dy) = ((p % w) as f64 - mx, (p / w) as f64 - my);
+            cxx += dx * dx;
+            cyy += dy * dy;
+            cxy += dx * dy;
+        }
+        let spread = ((cxx - cyy).powi(2) + 4.0 * cxy * cxy).sqrt();
+        let (lam1, lam2) = (0.5 * (cxx + cyy + spread), 0.5 * (cxx + cyy - spread));
+        let theta_b = 0.5 * (2.0 * cxy).atan2(cxx - cyy);
+        let straight = lam1 > 2.5 * lam2.max(1e-9);
+        let (mut gxx, mut gyy, mut gxy, mut gn) = (0.0f64, 0.0f64, 0.0f64, 0u32);
+        let (bx0, by0, bx1, by1) = (x0.saturating_sub(10).max(3), y0.saturating_sub(10).max(3), (x1 + 10).min(w - 4), (y1 + 10).min(h - 4));
+        for yy in by0..=by1 {
+            for xx in bx0..=bx1 {
+                let k = yy * w + xx;
+                let g = pick[k];
+                if !inpart(g) || pick[k - 2] != g || pick[k + 2] != g || pick[k - 2 * w] != g || pick[k + 2 * w] != g {
+                    continue;
+                }
+                // Only pixels within 10 px of the run count.
+                let near = mem.iter().step_by(4).any(|&p| ((p % w) as i64 - xx as i64).abs() <= 10 && ((p / w) as i64 - yy as i64).abs() <= 10);
+                if !near {
+                    continue;
+                }
+                let gx = 0.5 * (labs[k + 1][0] - labs[k - 1][0]) as f64;
+                let gy = 0.5 * (labs[k + w][0] - labs[k - w][0]) as f64;
+                gxx += gx * gx;
+                gyy += gy * gy;
+                gxy += gx * gy;
+                gn += 1;
+            }
+        }
+        let cross_min = EDGE_CROSS_DEG;
+        let en = gxx + gyy;
+        let coh = ((gxx - gyy).powi(2) + 4.0 * gxy * gxy).sqrt() / en.max(1e-9);
+        let cross = if gn >= 30 && en / gn as f64 >= 0.1 && coh >= 0.15 {
+            let theta_s = 0.5 * (2.0 * gxy).atan2(gxx - gyy) + std::f64::consts::FRAC_PI_2;
+            let t = (theta_s - theta_b).abs() % std::f64::consts::PI;
+            Some(t.min(std::f64::consts::PI - t).to_degrees())
+        } else {
+            None
+        };
+        if cross_min > 0.0 && !(straight && cross.map(|c| c >= cross_min).unwrap_or(false)) {
+            continue;
+        }
+        let mean = mem.iter().map(|&p| step[p] as f64).sum::<f64>() / mem.len() as f64;
+        let mut d = Defect { kind: Kind::CardEdge, raw: mean, score: mean / EDGE_DE, note: String::new(), tris: Vec::new(), anchors: Vec::new(), boxes: Vec::new(), island: None, screen: Some(Screen { view: sc.name.clone(), px: sc.px, bbox: [x0 as i32 - 8, y0 as i32 - 8, x1 as i32 + 8, y1 as i32 + 8] }) };
+        attach_pixels(&mut d, model, tex, sc, &mem);
+        d.note = format!("card edge {} px long where two cards meet flush (not welded, no depth gap): colour steps by {:.0} (Lab) across it, so the paint does not run on from one card to the next", mem.len(), mean);
         out.defects.push(d);
     }
     out
