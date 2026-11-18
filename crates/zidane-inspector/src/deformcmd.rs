@@ -487,7 +487,7 @@ pub fn deform_cmd(args: &Args) -> Result<(), String> {
 // Picture sheets
 // ---------------------------------------------------------------------------------------------
 
-fn ring(rgba: &mut [u8], w: usize, h: usize, cx: f32, cy: f32, r: f32, color: [u8; 3]) {
+pub(crate) fn ring(rgba: &mut [u8], w: usize, h: usize, cx: f32, cy: f32, r: f32, color: [u8; 3]) {
     let t = 2.2;
     let (x0, x1) = (((cx - r - t - 1.0).floor().max(0.0)) as usize, ((cx + r + t + 1.0).ceil().min(w as f32 - 1.0)) as usize);
     let (y0, y1) = (((cy - r - t - 1.0).floor().max(0.0)) as usize, ((cy + r + t + 1.0).ceil().min(h as f32 - 1.0)) as usize);
@@ -501,7 +501,7 @@ fn ring(rgba: &mut [u8], w: usize, h: usize, cx: f32, cy: f32, r: f32, color: [u
     }
 }
 
-fn line(rgba: &mut [u8], w: usize, h: usize, a: [f32; 2], b: [f32; 2], color: [u8; 3]) {
+pub(crate) fn line(rgba: &mut [u8], w: usize, h: usize, a: [f32; 2], b: [f32; 2], color: [u8; 3]) {
     let n = ((b[0] - a[0]).abs().max((b[1] - a[1]).abs()).ceil() as usize).clamp(1, 4000);
     for i in 0..=n {
         let t = i as f32 / n as f32;

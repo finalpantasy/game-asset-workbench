@@ -3769,3 +3769,191 @@ fn seam_blend(hs: &HairSet, stock_uv: &[[[f64; 2]; 3]], hair: &[bool], occ: &[bo
         }
     }
 }
+
+/// Stretches Lab lightness of the `mask` texels about their median by `k` (1 = unchanged), the same
+/// factor at every scale, so fine strands, strand bundles, lock grooves and broad shading gain
+/// contrast together and keep their share of it. A stretched colour that leaves the sRGB gamut keeps
+/// its a, b and takes the nearest in-gamut lightness. Returns (median L, texels pulled into gamut).
+pub fn stretch_l(rgba: &mut [u8], mask: &[bool], k: f64) -> (f64, usize) {
+    let mut ls: Vec<f64> = mask.iter().enumerate().filter(|(_, &m)| m).map(|(i, _)| lab([rgba[i * 4] as f64, rgba[i * 4 + 1] as f64, rgba[i * 4 + 2] as f64])[0]).collect();
+    if ls.is_empty() || (k - 1.0).abs() < 1e-9 {
+        return (0.0, 0);
+    }
+    ls.sort_by(f64::total_cmp);
+    let med = ls[ls.len() / 2];
+    let inside = |c: [f64; 3]| rgb(c).iter().all(|&x| (-0.5..=255.5).contains(&x));
+    let mut pulled = 0usize;
+    for (i, _) in mask.iter().enumerate().filter(|(_, &m)| m) {
+        let c = lab([rgba[i * 4] as f64, rgba[i * 4 + 1] as f64, rgba[i * 4 + 2] as f64]);
+        let mut t = [med + (c[0] - med) * k, c[1], c[2]];
+        if !inside(t) {
+            // Walk lightness back toward the original until the colour fits.
+            let (mut lo, mut hi) = (0.0f64, 1.0f64);
+            for _ in 0..12 {
+                let m = 0.5 * (lo + hi);
+                if inside([c[0] + (t[0] - c[0]) * m, c[1], c[2]]) {
+                    lo = m;
+                } else {
+                    hi = m;
+                }
+            }
+            t[0] = c[0] + (t[0] - c[0]) * lo;
+            pulled += 1;
+        }
+        let o = rgb(t);
+        for ch in 0..3 {
+            rgba[i * 4 + ch] = o[ch].round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    (med, pulled)
+}
+
+/// Stretches only the detail of the lightness: each `chart` texel's L moves away from its chart's
+/// local mean (a box of radius `r` texels over texels of the same chart) by `k` (1 = unchanged).
+/// Strands, bundles and grooves finer than about 2r gain contrast; the tone of a card as a whole,
+/// and so the step between two cards where one lies on the other, stays as it was. Charts are
+/// treated apart, so a neighbouring chart on the sheet never leaks into the mean. Out-of-gamut
+/// results keep a, b and take the nearest in-gamut lightness. Returns texels pulled into gamut.
+pub fn stretch_detail(rgba: &mut [u8], chart: &[usize], size: usize, k: f64, r: usize) -> usize {
+    stretch_band(rgba, chart, size, k, 0, r, 0)
+}
+
+/// Band version of [`stretch_detail`]: the part of L between a box mean of radius `r_in` (0 = the
+/// texel itself) and one of radius `r` is scaled by `k`. With `r_in` above the strand width this
+/// lifts the light and dark of whole locks and bundles and leaves the strands as they were.
+/// `fade` > 0 eases the stretch in over that many texels from the chart's edge and from its alpha
+/// cut (alpha under 128), so the step where one card's edge lies on another does not grow.
+pub fn stretch_band(rgba: &mut [u8], chart: &[usize], size: usize, k: f64, r_in: usize, r: usize, fade: usize) -> usize {
+    if (k - 1.0).abs() < 1e-9 || r == 0 || r_in >= r {
+        return 0;
+    }
+    let n = chart.iter().filter(|&&c| c != usize::MAX).map(|&c| c + 1).max().unwrap_or(0);
+    let mut bb = vec![(usize::MAX, usize::MAX, 0usize, 0usize); n];
+    for (i, &c) in chart.iter().enumerate() {
+        if c == usize::MAX {
+            continue;
+        }
+        let (x, y) = (i % size, i / size);
+        let b = &mut bb[c];
+        *b = (b.0.min(x), b.1.min(y), b.2.max(x), b.3.max(y));
+    }
+    let l_of = |px: &[u8], i: usize| lab([px[i * 4] as f64, px[i * 4 + 1] as f64, px[i * 4 + 2] as f64]);
+    let inside = |c: [f64; 3]| rgb(c).iter().all(|&x| (-0.5..=255.5).contains(&x));
+    let src = rgba.to_vec();
+    let mut pulled = 0usize;
+    for (c, &(x0, y0, x1, y1)) in bb.iter().enumerate() {
+        if x0 == usize::MAX {
+            continue;
+        }
+        let (w, h) = (x1 - x0 + 1, y1 - y0 + 1);
+        let iw = w + 1;
+        let mut s_l = vec![0.0f64; iw * (h + 1)];
+        let mut s_m = vec![0.0f64; iw * (h + 1)];
+        let mut labs = vec![[0.0f64; 3]; w * h];
+        for y in 0..h {
+            let (mut rl, mut rm) = (0.0, 0.0);
+            for x in 0..w {
+                let i = (y0 + y) * size + x0 + x;
+                if chart[i] == c {
+                    let q = l_of(&src, i);
+                    labs[y * w + x] = q;
+                    rl += q[0];
+                    rm += 1.0;
+                }
+                s_l[(y + 1) * iw + x + 1] = s_l[y * iw + x + 1] + rl;
+                s_m[(y + 1) * iw + x + 1] = s_m[y * iw + x + 1] + rm;
+            }
+        }
+        // Chamfer distance (in texels, 3-4 weights / 3) to the nearest texel outside the chart or
+        // under the alpha cut; only needed when the stretch fades in from edges.
+        let mut dist = vec![f64::INFINITY; w * h];
+        if fade > 0 {
+            let solid = |x: usize, y: usize| -> bool {
+                let i = (y0 + y) * size + x0 + x;
+                chart[i] == c && src[i * 4 + 3] >= 128
+            };
+            let mut d = vec![u32::MAX / 2; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    if !solid(x, y) {
+                        d[y * w + x] = 0;
+                    } else if x == 0 || y == 0 || x + 1 == w || y + 1 == h {
+                        d[y * w + x] = 3;
+                    }
+                }
+            }
+            for y in 0..h {
+                for x in 0..w {
+                    let mut v = d[y * w + x];
+                    if x > 0 { v = v.min(d[y * w + x - 1] + 3); }
+                    if y > 0 {
+                        v = v.min(d[(y - 1) * w + x] + 3);
+                        if x > 0 { v = v.min(d[(y - 1) * w + x - 1] + 4); }
+                        if x + 1 < w { v = v.min(d[(y - 1) * w + x + 1] + 4); }
+                    }
+                    d[y * w + x] = v;
+                }
+            }
+            for y in (0..h).rev() {
+                for x in (0..w).rev() {
+                    let mut v = d[y * w + x];
+                    if x + 1 < w { v = v.min(d[y * w + x + 1] + 3); }
+                    if y + 1 < h {
+                        v = v.min(d[(y + 1) * w + x] + 3);
+                        if x + 1 < w { v = v.min(d[(y + 1) * w + x + 1] + 4); }
+                        if x > 0 { v = v.min(d[(y + 1) * w + x - 1] + 4); }
+                    }
+                    d[y * w + x] = v;
+                }
+            }
+            for (o, &v) in dist.iter_mut().zip(&d) {
+                *o = v as f64 / 3.0;
+            }
+        }
+        let bs_r = |s: &[f64], x: usize, y: usize, r: usize| -> f64 {
+            let (xa, ya) = (x.saturating_sub(r), y.saturating_sub(r));
+            let (xb, yb) = ((x + r + 1).min(w), (y + r + 1).min(h));
+            s[yb * iw + xb] - s[ya * iw + xb] - s[yb * iw + xa] + s[ya * iw + xa]
+        };
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y0 + y) * size + x0 + x;
+                if chart[i] != c {
+                    continue;
+                }
+                let cnt = bs_r(&s_m, x, y, r);
+                if cnt <= 0.0 {
+                    continue;
+                }
+                let mean = bs_r(&s_l, x, y, r) / cnt;
+                let q = labs[y * w + x];
+                let fine = if r_in == 0 { q[0] } else { bs_r(&s_l, x, y, r_in) / bs_r(&s_m, x, y, r_in).max(1.0) };
+                let ease = if fade > 0 {
+                    let u = (dist[y * w + x] / fade as f64).clamp(0.0, 1.0);
+                    u * u * (3.0 - 2.0 * u)
+                } else {
+                    1.0
+                };
+                let mut t = [q[0] + (k - 1.0) * ease * (fine - mean), q[1], q[2]];
+                if !inside(t) {
+                    let (mut lo, mut hi) = (0.0f64, 1.0f64);
+                    for _ in 0..12 {
+                        let m = 0.5 * (lo + hi);
+                        if inside([q[0] + (t[0] - q[0]) * m, q[1], q[2]]) {
+                            lo = m;
+                        } else {
+                            hi = m;
+                        }
+                    }
+                    t[0] = q[0] + (t[0] - q[0]) * lo;
+                    pulled += 1;
+                }
+                let o = rgb(t);
+                for ch in 0..3 {
+                    rgba[i * 4 + ch] = o[ch].round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+    pulled
+}

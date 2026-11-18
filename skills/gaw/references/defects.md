@@ -12,7 +12,7 @@ gaw defects cand.glb --part hair --ref stock.glb --out-dir OUT
 
 | Kind | What it measures | Needs |
 |---|---|---|
-| `jagged-edge` | Stair steps along alpha-cutout and silhouette contours: contour roughness after smoothing, and how many up-and-down steps a stretch has | close views |
+| `jagged-edge` | Stair steps along alpha-cutout and silhouette contours: contour roughness after smoothing, and how many up-and-down steps a stretch has. Occlusion edges are left out: a contour point whose outside neighbours are all another part's surface lying clearly nearer the camera (5 pixel footprints, or 0.6% of the view height if that is more) is that occluder's outline (hair tips over a collar), judged with the occluder's part. The load's `occluded_contour_px` counts them | close views |
 | `discoloration` | Patches of the part far from the part's own palette and from the ring around them | close and game views |
 | `seam-stripe` | A color step across a UV seam that is continuous in 3D (the two sides should match and do not) | mesh and texture |
 | `direction-break` | Hair strands turning across a seam, or inside a card (same measure as `judge --strands`; a double-sided card's front and back triangles count as one face) | `--part hair` |
@@ -165,6 +165,20 @@ Corvin v9 (`experiments/original-test-character-v1/build/v9/paint/Corvin.glb`) a
 | jagged-edge load (1.5x) | pass | pass | 0.8% vs 0.0% FAIL | 0.8% vs 0.0% FAIL |
 
 Two Corvin results stay red and are not the yardstick's fault. Head flat-patch (4.1%): the boxes sit on smooth neck and nape skin, which is legitimate in a flat painted style, and on very dark navy hair cards of near one tone; the head's own median variance is dominated by hair detail, so skin and dark cards fall under a fifth of it. A per-material baseline would fix that and is not built; read those boxes on the overview and decide by eye. Torso jagged-edge (0.8% of contour pixels against stock's 0.0%) is unchanged by either flag and may be a real stair-step on the cutout silhouette; check it.
+
+Corvin v10 (`build/v10n/paint/Corvin-v10.glb`, 11-17), with the occlusion-edge rule in jagged-edge:
+
+| Rule | head | torso |
+|---|---|---|
+| jagged-edge load (1.5x) | 0.20% vs 0.13% FAIL (0.196%) | 0.005% vs 0.11% pass |
+| flat-patch load (2.0x) | 1.3% vs 1.1% pass (2.1%) | 0.0% vs 2.2% pass |
+| layer-direction-cut count (1.5x) | 14 vs 10 pass (15) | 7 vs 9 pass |
+| smear-blur load (1.5x) | pass | pass |
+
+Everything else passes in both. What moved the numbers was art, not the yardstick:
+- Torso jagged-edge (0.8%, and 5.2% on the first v10 build) came from bone-part borders zig-zagging across garments. Garment leads (`part_clean.py`) fixed it; forced arm/torso leads on a cut shoulder plane made it worse (0.006% to 3.3%). The torso would also pass without the occlusion rule (0.005% against the old 0.0067% reference).
+- Head flat-patch (4.1%) fell once the hair paint keyed its strands on the texel column (the per-lock attribute had three values, so half the locks were one tone). Strand cells also had to be 8-16 texels wide to survive the 3-4 mip levels of minification in the 768 px views. A fine skin grain on face and neck finished it. A coarser grain read as blotches on the face, and halving the fine grain failed the rule (2.7%).
+- Head jagged-edge and layer cuts pull against each other at the hair tips. Short under-layer tips ending just beside a top-layer tip make small stair steps; tucking them higher fixes that, but a tucked tip ends inside the lock above it, and where the two locks differ in tone the gate counts a layer cut. Calmer lock-to-lock tones (`LOCK_CALM`) pay for the back tuck (0.27% to 0.20%, cuts 14). Tucking the side tips too passes jagged-edge (0.16%) but takes cuts to 20.
 
 The hair gate with the code that has these flags: the same lines, to the digit, for stock, v3, v4 and v5 as in the table above (stock passes; v3, v4 and v5 fail; card-edge counts 4, 35, 39, 32; the same marks hit).
 

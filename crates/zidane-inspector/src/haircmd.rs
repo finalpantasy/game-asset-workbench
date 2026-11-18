@@ -36,6 +36,20 @@ pub const HAIR_USAGE: &str = "  gaw hair file.glb --out-dir NEW_FOLDER [options]
       share of the other's paint within R of its plane, more near its own open edge, so the edge
       does not read as a cut. --uv-seam 24 (texels, 0 = off): blend across every edge two hair
       triangles share in the stock layout, W texels either side, so paint runs on across folds.
+      --crisp 1.0 (lightness stretch of the whole bake about the hair's median L, every scale
+      together: strands, grooves and shading gain contrast and keep their balance; 1 = off).
+      --crisp-radius R (texels, 0 = the whole-bake stretch): stretch only detail finer than about
+      2R, about each chart's local mean, so a card's overall tone (the step where one card lies on
+      another) does not grow. --crisp-fade F (texels, 0 = off): ease both stretches in over F
+      texels from each chart's edge and alpha cut, so card-edge steps stay as they were.
+      --crisp-inner R0 (texels, 0 = each texel): leave detail finer than about 2 R0 as it is, so
+      one- and two-pixel dots in the close-up do not gain contrast.
+      --fine-soften 0 (0 to 1, runs before the stretches): pull lightness that share of the way to
+      the chart-local box mean of radius --fine-soften-radius 1 texels. Fiber gaps one or two
+      texels wide turn into dashed lines once resampled into the stock UVs; this blurs them out.
+      --lock-lift 1.0 (lightness between box means of radius --lock-lift-inner 24 and
+      --lock-lift-outer 192 texels, inside each chart, times K: lifts lock-to-lock light and dark
+      and leaves the strands alone; 1 = off).
       --pick-maps: write only OUT/pick-VIEW.png and pick-VIEW.bin (480 x 480 i32, the mesh's
       triangle index per pixel, -1 elsewhere) for the closelook turntable cameras, then stop.
       Look: --look stock|warm (warm = hue -15, chroma x1.25, L +12, contrast 0.6, clumps x1.5),
@@ -881,6 +895,33 @@ fn run(args: &Args, ri: &RunIn) -> Result<RunOut, String> {
     let ctx = SynthCtx { style: &style, pal: &pal, size: hair_size, vmax };
     let bin = BakeIn { model: &model, hs: &hs, fl: &fl, pr: &pr, charts: &charts, scale, size, pad, stock: Sheet { w: stock.w, h: stock.h, rgba: &stock_tex.rgba }, stock_alpha: sa, ao, ctx, look: Some(&look), sdf_spread: num(args, "--sdf-spread", 2.0)?, grown: grown_hs.clone(), root_line: num(args, "--root-line", if surf { 0.0 } else { 14.0 })?, grown_shade: num(args, "--grown-shade", if surf { 0.0 } else { 20.0 })?, crevice: num(args, "--crevice", if surf { 0.0 } else { 26.0 })?, alpha_min_area: num(args, "--alpha-min-area", 160)?, alpha_min_width: num(args, "--alpha-min-width", 4.0)? };
     let map = hair::bake(&bin, &mut rgba);
+    // Crisp: one lightness stretch over the whole bake, every scale together (strands, grooves,
+    // shading), so the hair gains contrast without moving its balance toward fine grain.
+    let crisp: f64 = num(args, "--crisp", 1.0)?;
+    let crisp_r: usize = num(args, "--crisp-radius", 0)?;
+    let crisp_fade: usize = num(args, "--crisp-fade", 0)?;
+    let crisp_in: usize = num(args, "--crisp-inner", 0)?;
+    let soften: f64 = num(args, "--fine-soften", 0.0)?;
+    if soften > 0.0 {
+        let sr: usize = num(args, "--fine-soften-radius", 1)?;
+        // L + (k - 1)(L - mean) with k = 1 - soften pulls each texel toward its chart-local box mean.
+        let pulled = hair::stretch_band(&mut rgba, &map.chart, size, 1.0 - soften.min(1.0), 0, sr, 0);
+        say(format!("fine soften: lightness {soften} of the way to the box mean of radius {sr} texels inside each chart; {pulled} texels pulled back into gamut"));
+    }
+    let lock_k: f64 = num(args, "--lock-lift", 1.0)?;
+    if lock_k != 1.0 {
+        let (r_in, r_out): (usize, usize) = (num(args, "--lock-lift-inner", 24)?, num(args, "--lock-lift-outer", 192)?);
+        let pulled = hair::stretch_band(&mut rgba, &map.chart, size, lock_k, r_in, r_out, crisp_fade);
+        say(format!("lock lift: lightness between box radius {r_in} and {r_out} texels x{lock_k} inside each chart; {pulled} texels pulled back into gamut"));
+    }
+    if crisp != 1.0 && crisp_r > 0 {
+        let pulled = hair::stretch_band(&mut rgba, &map.chart, size, crisp, crisp_in, crisp_r, crisp_fade);
+        say(format!("crisp: lightness detail x{crisp} between box radius {crisp_in} and {crisp_r} texels inside each chart, eased in over {crisp_fade} texels from chart and alpha edges); {pulled} texels pulled back into gamut"));
+    } else if crisp != 1.0 {
+        let hair_tx: Vec<bool> = map.chart.iter().map(|&c| c != usize::MAX).collect();
+        let (med, pulled) = hair::stretch_l(&mut rgba, &hair_tx, crisp);
+        say(format!("crisp: lightness x{crisp} about the hair median L {med:.1}; {pulled} texels pulled back into gamut"));
+    }
     say(format!("gutter texels: {}, {} taken from the surface across welded edges", map.gutter, map.gutter_surface));
     let suv: Vec<[[f64; 2]; 3]> = (0..hs.tris.len())
         .map(|i| std::array::from_fn(|c| {
@@ -1138,6 +1179,9 @@ fn run(args: &Args, ri: &RunIn) -> Result<RunOut, String> {
     let lo = LookOpts { small: num(args, "--look-small", 30)?, ..LookOpts::default() };
     let mut look_views: Vec<Value> = Vec::new();
     let (mut look_ours, mut look_stock) = (LookStats::default(), LookStats::default());
+    // The same close look on the texture-only file (--uv stock): the resample, cross and seam
+    // blends act there, so its sharpness is the one that ships.
+    let mut look_suv = LookStats::default();
     if ri.renders {
         let half = hair_size as f32 * 0.62;
         let shs = ri.stock_hs.unwrap_or(&hs);
@@ -1155,6 +1199,9 @@ fn run(args: &Args, ri: &RunIn) -> Result<RunOut, String> {
             look_views.push(json!({ "view": vname, "ours": look_json(&a), "stock": look_json(&b) }));
             look_ours.add(&a);
             look_stock.add(&b);
+            if let Some(m) = &stock_uv_model {
+                look_suv.add(&close_look(m, &stock_uv_tex, shs, &hs, yaw, pitch, half, 480, &lo).0);
+            }
         }
         save_png(&out.join("close-look-layers.png"), lw, lh, &sheet)?;
     }
@@ -1213,6 +1260,12 @@ fn run(args: &Args, ri: &RunIn) -> Result<RunOut, String> {
             jump_frac(&look_ours), jump_frac(&look_stock), look_ours.jump_px, look_stock.jump_px,
             ours_isl.0, ours_isl.1, stock_isl.0, ours_isl.2, ours_isl.3, stock_isl.2,
             if look_fail.is_empty() { "; pass".to_string() } else { format!("; FAIL: {}", look_fail.join(", ")) }
+        ));
+    }
+    if ri.renders && stock_uv_model.is_some() {
+        say(format!(
+            "close look, stock UVs (texture only / stock): sharpness across strands {:.3} / {:.3} ({:.2} x stock), flat share {:.4} / {:.4}, specks {} / {}, holes {} / {}",
+            look_suv.sharpness, look_stock.sharpness, look_suv.sharpness / look_stock.sharpness.max(1e-9), flat_frac(&look_suv), flat_frac(&look_stock), look_suv.specks, look_stock.specks, look_suv.holes, look_stock.holes
         ));
     }
 
@@ -1334,7 +1387,7 @@ fn run(args: &Args, ri: &RunIn) -> Result<RunOut, String> {
             "angle_median_global": a.median_after, "angle_p90_global": a.p90_after, "over45_global": a.over45_after,
             "comb_strokes": gf.comb.len(), "combed_triangles": a.combed, "locks_against_tips": a.tip_against, "locks_flipped": a.tip_flipped })),
         "close_look": { "opts": { "small_px": lo.small, "flat_std": lo.flat_std, "flat_min": lo.flat_min, "jump_deg": lo.jump_deg, "sharp_target": sharp_target, "island_small": isl_small, "jump_tolerance": jump_tol },
-            "ours": look_json(&look_ours), "stock": look_json(&look_stock), "views": look_views,
+            "ours": look_json(&look_ours), "stock": look_json(&look_stock), "stock_uv": stock_uv_model.as_ref().map(|_| look_json(&look_suv)), "views": look_views,
             "texture": { "ours": { "islands": ours_isl.0, "island_texels": ours_isl.1, "holes": ours_isl.2, "hole_texels": ours_isl.3 },
                          "stock": { "islands": stock_isl.0, "island_texels": stock_isl.1, "holes": stock_isl.2, "hole_texels": stock_isl.3 } },
             "failures": look_fail, "passed": look_fail.is_empty() },

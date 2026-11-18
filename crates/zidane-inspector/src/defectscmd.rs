@@ -284,6 +284,7 @@ fn analyze(model: &Model, tex: &[Option<Texture>], keep: &Keep, drawn: &[Drawn],
     let mut screen: Vec<Defect> = Vec::new();
     let mut mesh_based: Vec<Defect> = Vec::new();
     let (mut contour, mut flagged_px, mut worst_rms) = (0usize, 0usize, 0.0f64);
+    let mut occluded_px = 0usize;
     let (mut part_px, mut outlier_px) = (0usize, 0usize);
     let (mut blur_measured, mut blur_tiles, mut flat_measured, mut flat_tiles) = (0usize, 0usize, 0usize, 0usize);
     let (mut edge_px, mut edge_flagged) = (0usize, 0usize);
@@ -345,6 +346,7 @@ fn analyze(model: &Model, tex: &[Option<Texture>], keep: &Keep, drawn: &[Drawn],
             contour += j.contour_px;
             flagged_px += j.flagged_px;
             worst_rms = worst_rms.max(j.worst_rms);
+            occluded_px += j.occluded_px;
             screen.extend(j.defects);
         }
         if kinds.contains(&Kind::Discolor) {
@@ -357,7 +359,7 @@ fn analyze(model: &Model, tex: &[Option<Texture>], keep: &Keep, drawn: &[Drawn],
         }
     }
     if kinds.contains(&Kind::Jagged) {
-        loads.insert(Kind::Jagged, Load { percent: if contour > 0 { 100.0 * flagged_px as f64 / contour as f64 } else { 0.0 }, measured: contour as f64, flagged: flagged_px as f64, extra: vec![("worst_rms_px".into(), worst_rms)] });
+        loads.insert(Kind::Jagged, Load { percent: if contour > 0 { 100.0 * flagged_px as f64 / contour as f64 } else { 0.0 }, measured: contour as f64, flagged: flagged_px as f64, extra: vec![("worst_rms_px".into(), worst_rms), ("occluded_contour_px".into(), occluded_px as f64)] });
     }
     if kinds.contains(&Kind::Discolor) {
         loads.insert(Kind::Discolor, Load { percent: if part_px > 0 { 100.0 * outlier_px as f64 / part_px as f64 } else { 0.0 }, measured: part_px as f64, flagged: outlier_px as f64, extra: vec![("palette_colors".into(), pal.centers.len() as f64)] });

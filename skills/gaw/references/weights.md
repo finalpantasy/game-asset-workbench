@@ -1,4 +1,4 @@
-# weights and deform-check: fit a new mesh to the stock skeleton, then test it moving
+# weights, deform-check and deform: fit a new mesh to the stock skeleton, then test it moving
 
 Two commands for a new or remeshed character that must run on FF9's 27-bone field skeleton and then go through `gaw fbx`. `gaw weights` gives the new mesh its skin weights from a stock model. `gaw deform-check` poses the result through every clip and fails it if it tears, collapses, passes through itself or carries bad weights. Flags: `gaw help`.
 

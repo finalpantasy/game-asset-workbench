@@ -12,6 +12,7 @@ mod haircmd;
 mod judgecmd;
 mod defectscmd;
 mod gatecmd;
+mod cutpair;
 mod closelookcmd;
 mod shipcmd;
 mod requestcmd;
@@ -188,7 +189,7 @@ fn main() {
         Some(c @ "requests") => (c.to_owned(), all[1..].to_vec()),
         Some(c @ "views") => (c.to_owned(), all[1..].to_vec()),
         Some(c @ "fbx") => (c.to_owned(), all[1..].to_vec()),
-        Some(c @ ("weights" | "deform-check")) => (c.to_owned(), all[1..].to_vec()),
+        Some(c @ ("weights" | "deform-check" | "deform")) => (c.to_owned(), all[1..].to_vec()),
         // A word that is not a file is a mistyped command: say so instead of opening the window.
         Some(c) if !c.starts_with("--") && !Path::new(c).exists() => ("help".to_owned(), vec![]),
         _ => ("view".to_owned(), all.clone()),

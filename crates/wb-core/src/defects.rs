@@ -26,6 +26,12 @@ pub type Keep = Vec<Vec<bool>>;
 
 pub const JAG_RMS_PX: f64 = 0.9;
 pub const JAG_STAIRS: usize = 4;
+/// Contour points where the part is hidden behind a nearer surface of another part (hair tips over
+/// a collar) are occlusion edges and do not count: the occluder's own part judges that outline.
+/// "Nearer" means by at least this many pixel footprints and this share of the view height at that
+/// depth (not of the depth itself: an orthographic camera's depth carries its arbitrary distance).
+pub const JAG_OCCLUDER_PX: f32 = 5.0;
+pub const JAG_OCCLUDER_REL: f32 = 0.006;
 pub const DISC_DE: f32 = 22.0;
 pub const DISC_RING_DE: f32 = 12.0;
 pub const STRIPE_DE: f64 = 14.0;
@@ -959,6 +965,63 @@ impl ShotCtx<'_> {
     fn mask(&self, kg: &[bool]) -> Vec<bool> {
         self.shot.pick.iter().map(|&g| g >= 0 && kg.get(g as usize).copied().unwrap_or(false)).collect()
     }
+
+    /// Camera depth of the surface under a pixel (perspective-correct across its triangle), and the
+    /// world size of one pixel at that depth.
+    fn depth(&self, model: &Model, x: usize, y: usize) -> Option<(f32, f32)> {
+        let gid = *self.shot.pick.get(y * self.px + x)?;
+        if gid < 0 {
+            return None;
+        }
+        let (mi, ti) = render::split_id(model, gid as usize);
+        let t = model.meshes.get(mi)?.tris.get(ti)?;
+        let pr: [[f32; 3]; 3] = std::array::from_fn(|k| self.cam.project(self.px, self.px, self.pose[mi][t[k] as usize]));
+        let (a, b, c) = (pr[0], pr[1], pr[2]);
+        let area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        let z = if area.abs() < 1e-9 {
+            (a[2] + b[2] + c[2]) / 3.0
+        } else {
+            let (sx, sy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let w0 = (((b[0] - sx) * (c[1] - sy) - (b[1] - sy) * (c[0] - sx)) / area).max(0.0);
+            let w1 = (((c[0] - sx) * (a[1] - sy) - (c[1] - sy) * (a[0] - sx)) / area).max(0.0);
+            let w2 = (1.0 - w0 - w1).max(0.0);
+            let s = (w0 + w1 + w2).max(1e-9);
+            if self.cam.ortho {
+                (w0 * a[2] + w1 * b[2] + w2 * c[2]) / s
+            } else {
+                s / (w0 / a[2].max(1e-6) + w1 / b[2].max(1e-6) + w2 / c[2].max(1e-6))
+            }
+        };
+        let foot = if self.cam.ortho { 2.0 * self.cam.ortho_half / self.px as f32 } else { 2.0 * z * (self.cam.fov_y * 0.5).tan() / self.px as f32 };
+        Some((z, foot))
+    }
+
+    /// True when a contour pixel of a part mask is an occlusion edge: every 4-neighbour outside the
+    /// mask is another part's surface lying clearly nearer the camera (by `JAG_OCCLUDER_PX` pixel
+    /// footprints and `JAG_OCCLUDER_REL` of the view height). That outline is the occluder's silhouette,
+    /// judged with the occluder's part; it says nothing about this part's edge.
+    fn occluded_edge(&self, model: &Model, mask: &[bool], x: i32, y: i32) -> bool {
+        let w = self.px as i32;
+        let Some((z, foot)) = self.depth(model, x as usize, y as usize) else { return false };
+        let margin = foot * JAG_OCCLUDER_PX.max(JAG_OCCLUDER_REL * self.px as f32);
+        let mut outside = 0;
+        for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let (xx, yy) = (x + dx, y + dy);
+            if xx < 0 || yy < 0 || xx >= w || yy >= w {
+                return false;
+            }
+            let j = (yy * w + xx) as usize;
+            if mask[j] {
+                continue;
+            }
+            outside += 1;
+            match self.depth(model, xx as usize, yy as usize) {
+                Some((zo, _)) if zo < z - margin => {}
+                _ => return false,
+            }
+        }
+        outside > 0
+    }
 }
 
 fn erode(mask: &[bool], w: usize, h: usize, times: usize) -> Vec<bool> {
@@ -1031,6 +1094,8 @@ pub struct JagOut {
     pub contour_px: usize,
     pub flagged_px: usize,
     pub worst_rms: f64,
+    /// Contour points left out as occlusion edges (another part's nearer surface draws them).
+    pub occluded_px: usize,
 }
 
 /// Stair steps along the part's contour in one view. `kg` is `keep_global`.
@@ -1067,6 +1132,14 @@ pub fn jagged(model: &Model, tex: &[Option<Texture>], sc: &ShotCtx, kg: &[bool])
             let e = [pts[i][0] as f64 - s[i][0], pts[i][1] as f64 - s[i][1]];
             dev[i] = (t[0] * e[1] - t[1] * e[0]) / l;
         }
+        // Occlusion edges (another part's nearer surface draws this stretch of the outline) carry no
+        // roughness of this part: zero them so they neither flag nor push neighbours over the limit.
+        let occ: Vec<bool> = pts.iter().map(|p| sc.occluded_edge(model, &mask, p[0], p[1])).collect();
+        for i in 0..n {
+            if occ[i] {
+                dev[i] = 0.0;
+            }
+        }
         // Zig-zags: sign changes of the offset that clear 0.6 px each way.
         let mut event = vec![0usize; n];
         let mut state = 0i32;
@@ -1093,9 +1166,10 @@ pub fn jagged(model: &Model, tex: &[Option<Texture>], sc: &ShotCtx, kg: &[bool])
             rms_at[i as usize] = rms;
             let q = at(i);
             let on_border = q[0] <= 1 || q[1] <= 1 || q[0] >= w as i32 - 2 || q[1] >= h as i32 - 2;
-            flag[i as usize] = !on_border && rms >= JAG_RMS_PX && ev >= JAG_STAIRS;
+            flag[i as usize] = !on_border && !occ[i as usize] && rms >= JAG_RMS_PX && ev >= JAG_STAIRS;
         }
-        out.contour_px += n;
+        out.contour_px += n - occ.iter().filter(|&&o| o).count();
+        out.occluded_px += occ.iter().filter(|&&o| o).count();
         out.flagged_px += flag.iter().filter(|&&f| f).count();
         out.worst_rms = out.worst_rms.max(rms_at.iter().cloned().fold(0.0, f64::max));
         // Runs of flagged points, merging gaps up to 8.

@@ -7,12 +7,15 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const GATE_USAGE: &str = "  gaw gate --spec GATE.json --out-dir NEW_DIR [CANDIDATE.glb] [--ref-run DIR]
+pub const GATE_USAGE: &str = "  gaw gate --spec GATE.json --out-dir NEW_DIR [CANDIDATE.glb] [--ref-run DIR] [--cand-run DIR]
       Runs `gaw defects` for the reference and the candidate named in the spec (the candidate can also
       come on the command line) and applies its rules. Rule types: `ratio` (count, load or worst score
       of some kinds at most k times the reference's) and `marks` (no more boxes of some kinds inside
       the marked circles than the reference has there; `allow: none` demands zero; `slack: N` widens the
-      circles by N view pixels, for marks drawn beside the cut). A ratio rule with
+      circles by N view pixels, for marks drawn beside the cut) and `stock-edge` (each box of some
+      kinds compared with the reference's picture at the same pixels: it counts as new only when
+      the reference shows no edge there, under `min_share` of the cut, or the candidate's Lab step
+      is worse by over `margin`; at most `max_new` new boxes). A ratio rule with
       `\"check\": \"deform\"` reads `gaw deform-check`'s summary (kinds stretch, squash, volume,
       intersect, weights; run once into OUT_DIR/deform) instead of the defects run. Prints PASS or
       FAIL per rule, writes gate-report.json with the numbers and the two defects.json runs, and
@@ -24,7 +27,8 @@ pub const GATE_USAGE: &str = "  gaw gate --spec GATE.json --out-dir NEW_DIR [CAN
       --spec GATE.json         rules: {part, reference, candidate?, marks | marks_file, rules:[..]}; see
                                skills/gaw/references/zidane-hair-gate.json
       --out-dir NEW_DIR        new or empty; gets candidate/ and reference/ (defects runs) and gate-report.json
-      --ref-run DIR            reuse an earlier reference run (its defects.json) instead of running it again";
+      --ref-run DIR            reuse an earlier reference run (its defects.json) instead of running it again
+      --cand-run DIR           rescore an earlier candidate run (its defects.json and views/) without running it";
 
 fn opt<'a>(a: &'a [String], k: &str) -> Option<&'a str> {
     a.iter().position(|x| x == k).and_then(|i| a.get(i + 1)).map(String::as_str)
@@ -196,7 +200,15 @@ pub fn gate_cmd(args: &Args) -> Result<(), String> {
         Some(Value::Number(n)) => extra.extend(["--cut-regions".to_owned(), n.to_string()]),
         _ => {}
     }
-    let crun = if want_defects { run_defects(Path::new(&cand), &part, Path::new(&reference), &out.join("candidate"), &extra)? } else { Value::Null };
+    // `--cand-run DIR` rescores an earlier candidate run (its defects.json and views) without running it again.
+    let cand_run_dir = opt(a, "--cand-run").map(|d| Path::new(d).to_path_buf());
+    let crun = if !want_defects {
+        Value::Null
+    } else if let Some(d) = &cand_run_dir {
+        read_json(&d.join("defects.json"))?
+    } else {
+        run_defects(Path::new(&cand), &part, Path::new(&reference), &out.join("candidate"), &extra)?
+    };
     let rrun = if !want_defects {
         Value::Null
     } else if let Some(d) = opt(a, "--ref-run") {
@@ -272,7 +284,29 @@ pub fn gate_cmd(args: &Args) -> Result<(), String> {
                 }
                 detail = json!({"allow": if none { "none" } else { "reference" }, "slack": slack, "marks": per});
             }
-            other => return Err(format!("rule {id}: unknown type {other} (use ratio or marks)")),
+            "stock-edge" => {
+                if is_deform || !want_defects {
+                    return Err(format!("rule {id}: `stock-edge` needs the defects runs"));
+                }
+                let margin = r.get("margin").and_then(Value::as_f64).unwrap_or(12.0) as f32;
+                let min_share = r.get("min_share").and_then(Value::as_f64).unwrap_or(0.5) as f32;
+                let max_new = r.get("max_new").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let cdir = cand_run_dir.clone().unwrap_or_else(|| out.join("candidate"));
+                let rdir = match opt(a, "--ref-run") {
+                    Some(d) => Path::new(d).to_path_buf(),
+                    None if Path::new(&cand) == Path::new(&reference) => cdir.clone(),
+                    None => out.join("reference"),
+                };
+                let (new, rows) = crate::cutpair::score_run(&cdir, &rdir, &crun, &kinds, margin, min_share)?;
+                pass = new <= max_new;
+                let all = rows.len();
+                lines.push(format!("{} boxes: {new} new against stock (step worse than stock's by over {margin} Lab, or stock edge on under {:.0}% of the cut), {} stock shows too; limit {max_new}", kinds.join("+"), min_share * 100.0, all - new));
+                for row in rows.iter().filter(|r| r.get("new").and_then(Value::as_bool) == Some(true)) {
+                    lines.push(format!("NEW  {} {}: step {:.1} against stock's {:.1}, stock edge on {:.0}%, another object in stock's picture on {:.0}%", row["id"].as_str().unwrap_or(""), row["view"].as_str().unwrap_or(""), row["candidate_step"].as_f64().unwrap_or(0.0), row["stock_step"].as_f64().unwrap_or(0.0), row["stock_edge_share"].as_f64().unwrap_or(0.0) * 100.0, row["other_object_share"].as_f64().unwrap_or(0.0) * 100.0));
+                }
+                detail = json!({"margin": margin, "min_share": min_share, "max_new": max_new, "new": new, "boxes": all, "rows": rows});
+            }
+            other => return Err(format!("rule {id}: unknown type {other} (use ratio, marks or stock-edge)")),
         }
         all_pass &= pass;
         println!("{} {id}", if pass { "PASS" } else { "FAIL" });
@@ -282,7 +316,7 @@ pub fn gate_cmd(args: &Args) -> Result<(), String> {
         results.push(json!({"id": id, "type": ty, "kinds": kinds, "pass": pass, "lines": lines, "detail": detail, "why": r.get("why")}));
     }
     println!("{}", if all_pass { "GATE PASS" } else { "GATE FAIL" });
-    let report = json!({"gaw_gate": 1, "name": spec.get("name"), "pass": all_pass, "candidate": cand, "reference": reference, "part": part, "spec": spec_path.display().to_string(), "rules": results, "runs": {"candidate": out.join("candidate").display().to_string(), "reference": if Path::new(&cand) == Path::new(&reference) { Value::Null } else { json!(out.join("reference").display().to_string()) }}});
+    let report = json!({"gaw_gate": 1, "name": spec.get("name"), "pass": all_pass, "candidate": cand, "reference": reference, "part": part, "spec": spec_path.display().to_string(), "rules": results, "runs": {"candidate": cand_run_dir.clone().unwrap_or_else(|| out.join("candidate")).display().to_string(), "reference": if Path::new(&cand) == Path::new(&reference) { Value::Null } else { json!(out.join("reference").display().to_string()) }}});
     std::fs::write(out.join("gate-report.json"), serde_json::to_vec_pretty(&report).unwrap()).map_err(|e| format!("gate-report.json: {e}"))?;
     println!("wrote {}", out.join("gate-report.json").display());
     if !all_pass {
