@@ -21,6 +21,7 @@ mod boundarycmd;
 mod fbxcmd;
 mod weightscmd;
 mod deformcmd;
+mod rkdeform;
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -208,6 +209,7 @@ fn main() {
         println!("{}", fbxcmd::FBX_USAGE);
         println!("{}", weightscmd::WEIGHTS_USAGE);
         println!("{}", deformcmd::DEFORM_USAGE);
+        println!("{}", rkdeform::RKDEFORM_USAGE);
         std::process::exit(2);
     }
     let args = Args(rest);
@@ -230,6 +232,7 @@ fn main() {
         "fbx" => fbxcmd::fbx_cmd(&args),
         "weights" => weightscmd::weights_cmd(&args),
         "deform-check" => deformcmd::deform_cmd(&args),
+        "deform" => rkdeform::rkdeform_cmd(&args),
         "roundtrip" => roundtrip(&args),
         "render" => render_cmd(&args),
         "shells" => strapcmd::shells_cmd(&args),
@@ -253,6 +256,7 @@ fn main() {
             println!("{}", fbxcmd::FBX_USAGE);
             println!("{}", weightscmd::WEIGHTS_USAGE);
             println!("{}", deformcmd::DEFORM_USAGE);
+        println!("{}", rkdeform::RKDEFORM_USAGE);
             Ok(())
         }
     };

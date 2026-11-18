@@ -21,3 +21,4 @@ serde_json.workspace = true
 image.workspace = true
 eframe = { version = "0.32", features = ["wgpu"] }
 rfd = "0.15"
+rigkit = { path = "../rigkit" }

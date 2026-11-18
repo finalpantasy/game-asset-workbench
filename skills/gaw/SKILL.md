@@ -34,6 +34,7 @@ Run it as `gaw` if it is on PATH, otherwise `target/release/gaw.exe` inside the 
 | Make an edited mesh load in the game as a custom model (FBX for Memoria) | `fbx cand.glb --out NEW --readback` | `references/fbx.md` |
 | Give a new mesh its skin weights from stock: a bare mesh with no armature (`--adopt-skeleton` copies stock's 27 bones in), or one already on the stock skeleton (new Zidane, remeshed copy, tailless model) | `weights new.glb --from stock.glb --out OUT.glb [--adopt-skeleton] [--radial 0.25 --soften 0 --repair 40]` (a body that is not stock's: also `--polish` on weights from Blender) | `references/weights.md` |
 | Check a skinned model through every clip before export: candy-wrapper twists, volume loss at joints, arm through torso, bad weights | `deform-check cand.glb --ref stock.glb --out-dir NEW` | `references/weights.md` (deform-check section) |
+| Count pinched skin and folded (inside-out) triangles in every clip, stock and candidate side by side, with the worst triangles by mesh and joint; rigkit-based | `deform STOCK.glb CAND.glb [--json] [--render-dir NEW]` | `references/weights.md` (deform section) |
 
 ## Core loops
 

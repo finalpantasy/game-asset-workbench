@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/wb-core", "crates/zidane-inspector"]
+members = ["crates/wb-core", "crates/zidane-inspector", "crates/rigkit"]
 
 [workspace.package]
 version = "0.1.0"

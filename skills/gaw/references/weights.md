@@ -127,6 +127,34 @@ Tailless: `--zero-bones tail` leaves 23 of 27 bones able to take weight and the 
 
 Refusals worth knowing (bare copies of stock, `--adopt-skeleton`): scaled by 100 gives one message, `scale the mesh by 0.0100` with the centimeter hint; scaled by 0.8 gives `scale the mesh by 1.2500`; moved up 0.15 (3 percent of the height, inside the 10 percent limit) is accepted and its largest distance to stock's surface is 0.15, which `weights.json` and the deform sheets show.
 
+## deform (rigkit): pinch and fold count, stock beside candidate
+
+`gaw deform STOCK.glb CAND.glb` plays both models through every clip with rigkit's `check::stretch` and prints one row per clip, stock beside candidate. Use it after `weights` or a rebuild when you want the plain counts (how bad is the worst pinch, how many triangles turn inside out, where) rather than `deform-check`'s pass or fail. It writes nothing unless `--render-dir NEW` is given. The command is built on rigkit (`crates/rigkit` in this repo); gaw only reads GLBs with wb-core and hands rigkit plain arrays.
+
+Each model is measured against its own rest pose. Columns: worst edge ratio (always at least 1; `pinch` means the worst edge got shorter, `pull` longer), worst area ratio, flipped triangles as `all/hard`, and a verdict. A hard flip also changed its worst edge by 1.5x or more; a flip with edges nearly unchanged is a near-degenerate sliver and does not count toward the verdict. WORSE means more hard flips than stock or a worst edge over 1.25x stock's; better means under 0.8x with no more hard flips. Under the table, each clip lists the worst triangles of each side by mesh, triangle number, dominant joint, pose time and ratios, then a per-mesh line so hair cards are judged apart from the body.
+
+A candidate with no clip of the same name (or no clips) is posed with stock's clip on the same joint order. Vertices with no weight, or naming a joint the skeleton lacks, are held at rest and counted in the header. `--json` prints everything (including `by_mesh` and the flipped lists); `--strict` exits 1 when any clip is WORSE; `--steps`, `--top`, `--min-edge`, `--clips` tune it (`gaw help`).
+
+`--render-dir NEW` writes `deform-stock.png` and `deform-cand.png`: per clip the worst triangle and the worst flipped one, outlined in red, posed on the left and at rest on the right, same camera. Open them. The ratio says a triangle collapsed; the picture says whether the collapse is a visible crumple or a sliver nobody sees.
+
+Known limits:
+
+- Stock has its own flaws (run: 28 flipped triangles, 24 hard, mostly upper arms; a 7x pull at the hips). That is why the output is a comparison. A candidate that equals stock passes.
+- rigkit records a triangle's flipped flag only when an edge changed, so a pure mirror flip is in the total but cannot be named (`flipped_unlisted` in the JSON, a note in the table). It is never a hard flip.
+- It measures edges and area, not crossings or volume. `deform-check` covers those.
+- The default minimum edge is 0.2 percent of stock's height, the same number for both models. A denser candidate has more small edges, so its worst ratio can look larger for the same real motion. Check the picture before blaming the weights.
+
+Measured on this machine (2026-11-17), idle, walk, run, turn_l, turn_r:
+
+| Candidate | Read |
+|---|---|
+| stock against itself | identical on every clip (the test holds this) |
+| `claude-zidane-whole-fable-v1` | WORSE in walk and run. Walk: 12.6x pinch at the right shin (stock 6.5x pull at the hips), 4 hard flips against stock's 2. Run: 20x pinch at the shins, 239 hard flips against stock's 24, on shins and upper arms. The render shows the trouser leg folding into the boot. Idle and turns: same as stock, apart from 2 sliver flips. |
+| `claude-zidane-hair-ref-v1/models/Zidane-hair-clean-v2.glb` | same as stock on every clip. Body is stock's; the hair cards move rigidly (worst edge 1.00x). |
+
+Tests: `cargo test -p zidane-inspector rkdeform` (pinch, flip, mirror, unweighted vertices, verdict, and rigkit against wb-core's own skinner on the worst stock triangle) and `--test deform_rk` (stock against itself is zero everywhere, clip filter, refused input, `--render-dir` never reuses a folder).
+
+
 ## Using it as a gate rule
 
 `gaw gate` can read `deform.json`: a `ratio` rule with `"check": "deform"` runs `gaw deform-check CAND --ref REF --out-dir OUT/deform` once and reads its `summary[]` (kinds `stretch`, `squash`, `volume`, `intersect`, `weights`; fields `defects`, `worst_score`, `load_percent`, `reference{..}`) the way it reads `defects.json`. Add `"defects": false` to the spec to skip the defects runs. The ready spec is `skills/gaw/references/deform-gate.json` (each kind at most 1.5x stock, `weights` none beyond stock): `gaw gate --spec skills/gaw/references/deform-gate.json --out-dir NEW CAND.glb` from the Modding folder. Stock passes against itself; `broken-a-forearm.glb` fails on stretch and `broken-all.glb` on stretch and weights. Marks rules do not apply to deform. Details: `references/defects.md` (gate section).

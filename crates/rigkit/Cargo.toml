@@ -1,0 +1,10 @@
+[package]
+name = "rigkit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Skinning, skin-weight transfer and motion checks (stretch, foot contact) for skinned meshes. No engine, no file format."
+
+[dependencies]
+glam = "0.32"
+rayon = "1.11"
